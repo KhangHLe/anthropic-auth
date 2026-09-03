@@ -316,7 +316,7 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(markerTexts([current])[0]).toContain('effort="x"')
   })
 
-  test('correlates a transform plan to the matching chat headers request', () => {
+  test('reuses a transform plan for retries of the matching chat request', () => {
     const plan = markOpenCodeEffortTransitions([
       user('msg_low', 'ses_headers', 'claude-fable-5-1', 'low'),
       user('msg_high', 'ses_headers', 'claude-fable-5-1', 'high'),
@@ -345,6 +345,19 @@ describe('OpenCode Fable 5.1 effort markers', () => {
     expect(headers['x-cortexkit-effort-plan']).toBe(
       encodeOpenCodeEffortPlan(plan as NonNullable<typeof plan>),
     )
+    const retryHeaders: Record<string, string> = {}
+    expect(
+      tracker.markHeaders({
+        sessionId: 'ses_headers',
+        messageId: 'msg_high',
+        headers: retryHeaders,
+      }),
+    ).toBe(true)
+    expect(retryHeaders['x-cortexkit-effort-plan']).toBe(
+      headers['x-cortexkit-effort-plan'],
+    )
+
+    tracker.clear('ses_headers', 'msg_high')
     expect(
       tracker.markHeaders({
         sessionId: 'ses_headers',

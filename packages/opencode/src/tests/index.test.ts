@@ -6468,29 +6468,42 @@ describe('Fable 5.1 request-scoped effort history', () => {
         }),
       { models: {} },
     )
-    await auth.fetch(MESSAGES_URL, {
-      method: 'POST',
-      headers: {
-        ...output.headers,
-        'x-session-affinity': 'ses_effort',
-      },
-      body: JSON.stringify({
-        model: 'claude-fable-5-1',
-        thinking: { type: 'adaptive', display: 'summarized' },
-        output_config: { effort: 'high' },
-        messages: [
-          { role: 'user', content: 'first' },
-          {
-            role: 'assistant',
-            content: [
-              { type: 'thinking', thinking: 'trace', signature: 'sig' },
-              { type: 'text', text: 'answer' },
-            ],
-          },
-          { role: 'user', content: loweredUserContent },
-        ],
-      }),
+    const loweredRequestBody = JSON.stringify({
+      model: 'claude-fable-5-1',
+      thinking: { type: 'adaptive', display: 'summarized' },
+      output_config: { effort: 'high' },
+      messages: [
+        { role: 'user', content: 'first' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'trace', signature: 'sig' },
+            { type: 'text', text: 'answer' },
+          ],
+        },
+        { role: 'user', content: loweredUserContent },
+      ],
     })
+    const send = (headers: Record<string, string>) =>
+      auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'x-session-affinity': 'ses_effort',
+        },
+        body: loweredRequestBody,
+      })
+    expect((await send(output.headers)).status).toBe(200)
+
+    const retryOutput = { headers: {} as Record<string, string> }
+    await plugin['chat.headers'](
+      { sessionID: 'ses_effort', message: { id: 'msg_effort_high' } },
+      retryOutput,
+    )
+    expect(retryOutput.headers['x-cortexkit-effort-plan']).toBe(
+      output.headers['x-cortexkit-effort-plan'],
+    )
+    expect((await send(retryOutput.headers)).status).toBe(200)
 
     expect(sentBody?.output_config).toEqual({ effort: 'low' })
     expect(sentBody?.messages).toEqual([

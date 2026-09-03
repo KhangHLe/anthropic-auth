@@ -556,7 +556,12 @@ export class OpenCodeEffortPlanTracker {
     const plan = this.plans.get(key)
     if (!plan) return false
     input.headers[EFFORT_PLAN_REQUEST_HEADER] = plan
+    // OpenCode retries the same StreamInput after transient provider failures.
+    // Its message transform runs once before the retry loop, while chat.headers
+    // runs for every attempt, so keep the plan available for the same message.
+    // Refresh its insertion order so an actively retried plan remains recent.
     this.plans.delete(key)
+    this.plans.set(key, plan)
     return true
   }
 

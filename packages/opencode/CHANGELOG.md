@@ -2,6 +2,12 @@
 
 This package is a CortexKit-maintained fork of the original `@ex-machina/opencode-anthropic-auth` plugin. Entries below this note are inherited from the upstream package history.
 
+## Unreleased
+
+### Patch Changes
+
+- Keep the request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, preventing a transient provider failure from turning the next attempt into a local missing-plan error.
+
 ## 1.22.0
 
 ### Minor Changes

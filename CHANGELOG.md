@@ -2,6 +2,12 @@
 
 This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi. The OpenCode package is a fork of the original `@ex-machina/opencode-anthropic-auth` plugin, so older entries below the initial CortexKit release are inherited from upstream package history.
 
+## Unreleased
+
+### Patch Changes
+
+- Keep OpenCode's request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, preventing a transient provider failure from turning the next attempt into a local missing-plan error.
+
 ## 1.22.0
 
 ### Minor Changes
