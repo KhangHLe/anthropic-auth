@@ -6447,14 +6447,28 @@ describe('Fable 5.1 request-scoped effort history', () => {
         },
         parts: [{ type: 'text', text: 'second' }],
       },
+      {
+        info: {
+          id: 'msg_effort_current',
+          role: 'user',
+          sessionID: 'ses_effort',
+          model: {
+            providerID: 'anthropic',
+            modelID: 'claude-fable-5-1',
+            variant: 'high',
+          },
+        },
+        parts: [{ type: 'text', text: 'current' }],
+      },
     ]
     await plugin['experimental.chat.messages.transform']({}, { messages })
-    const loweredUserContent = messages[3]?.parts
-      .filter((part) => part.type === 'text')
-      .map((part) => ({ type: 'text', text: part.text }))
+    const loweredUserContent = (index: number) =>
+      messages[index]?.parts
+        .filter((part) => part.type === 'text')
+        .map((part) => ({ type: 'text', text: part.text }))
     const output = { headers: {} as Record<string, string> }
     await plugin['chat.headers'](
-      { sessionID: 'ses_effort', message: { id: 'msg_effort_high' } },
+      { sessionID: 'ses_effort', message: { id: 'msg_effort_current' } },
       output,
     )
 
@@ -6481,7 +6495,8 @@ describe('Fable 5.1 request-scoped effort history', () => {
             { type: 'text', text: 'answer' },
           ],
         },
-        { role: 'user', content: loweredUserContent },
+        { role: 'user', content: loweredUserContent(3) },
+        { role: 'user', content: loweredUserContent(4) },
       ],
     })
     const send = (headers: Record<string, string>) =>
@@ -6497,7 +6512,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
 
     const retryOutput = { headers: {} as Record<string, string> }
     await plugin['chat.headers'](
-      { sessionID: 'ses_effort', message: { id: 'msg_effort_high' } },
+      { sessionID: 'ses_effort', message: { id: 'msg_effort_current' } },
       retryOutput,
     )
     expect(retryOutput.headers['x-cortexkit-effort-plan']).toBe(
@@ -6524,6 +6539,10 @@ describe('Fable 5.1 request-scoped effort history', () => {
         role: 'user',
         content: [{ type: 'text', text: 'second' }],
       },
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'current' }],
+      },
     ])
     expect(sentBody?.thinking.block_binding).toEqual({
       prefix_mismatch_behavior: 'error',
@@ -6539,6 +6558,28 @@ describe('Fable 5.1 request-scoped effort history', () => {
         header.startsWith('x-cortexkit-effort'),
       ),
     ).toBe(false)
+
+    const prefixTrimmedResponse = await auth.fetch(MESSAGES_URL, {
+      method: 'POST',
+      headers: {
+        ...retryOutput.headers,
+        'x-session-affinity': 'ses_effort',
+      },
+      body: JSON.stringify({
+        model: 'claude-fable-5-1',
+        thinking: { type: 'adaptive', display: 'summarized' },
+        output_config: { effort: 'high' },
+        messages: [{ role: 'user', content: loweredUserContent(4) }],
+      }),
+    })
+    expect(prefixTrimmedResponse.status).toBe(200)
+    expect(sentBody?.output_config).toEqual({ effort: 'high' })
+    expect(sentBody?.messages).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'current' }],
+      },
+    ])
   })
 
   test('fails locally when request-correlated effort markers cannot be validated', async () => {

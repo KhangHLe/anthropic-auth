@@ -5199,6 +5199,8 @@ const anthropicAuthPlugin = async (
             const subagentRequest = isSubagentRequest(requestHeaders)
             const effortPlanHeader =
               requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
+            const resolvedEffortPlan =
+              effortPlanTracker.resolveHeader(effortPlanHeader)
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
@@ -5227,6 +5229,7 @@ const anthropicAuthPlugin = async (
                   sessionId: directAffinity || undefined,
                   midConversationEffortEnabled: false,
                   midConversationEffortPlan: effortPlanHeader,
+                  midConversationEffortResolvedPlan: resolvedEffortPlan,
                   perf: (stage, data) =>
                     trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
                 })
@@ -5416,6 +5419,8 @@ const anthropicAuthPlugin = async (
             const subagentRequest = isSubagentRequest(requestHeaders)
             const effortPlanHeader =
               requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
+            const resolvedEffortPlan =
+              effortPlanTracker.resolveHeader(effortPlanHeader)
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
@@ -5492,6 +5497,7 @@ const anthropicAuthPlugin = async (
                     ),
                   midConversationEffortEnabled: true,
                   midConversationEffortPlan: effortPlanHeader,
+                  midConversationEffortResolvedPlan: resolvedEffortPlan,
                   hybridStandbyAnchor: standbyCacheAnchor,
                   serverSideFallbackEnabled: fallbackMode === 'server',
                   laneStart: laneStartRequest,

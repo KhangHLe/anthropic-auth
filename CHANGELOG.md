@@ -6,7 +6,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
-- Keep OpenCode's request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, preventing a transient provider failure from turning the next attempt into a local missing-plan error.
+- Keep OpenCode's request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.
 
 ## 1.22.0
 

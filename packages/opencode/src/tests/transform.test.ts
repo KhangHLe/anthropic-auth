@@ -603,7 +603,7 @@ describe('setOAuthHeaders', () => {
     const internalMarkers = sourceMessages[2]?.parts
       .slice(1)
       .flatMap((part) => (typeof part.text === 'string' ? [part.text] : []))
-    expect(internalMarkers).toHaveLength(1)
+    expect(internalMarkers).toHaveLength(2)
     const body = JSON.parse(
       await rewriteRequestBody(
         JSON.stringify({

@@ -6,7 +6,7 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ### Patch Changes
 
-- Keep the request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, preventing a transient provider failure from turning the next attempt into a local missing-plan error.
+- Keep the request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.
 
 ## 1.22.0
 

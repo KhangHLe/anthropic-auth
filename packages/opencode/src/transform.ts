@@ -42,6 +42,7 @@ import {
 import {
   applyOpenCodeEffortMarkers,
   EffortMarkerCorrelationError,
+  type OpenCodeEffortMarkerPlan,
 } from './effort-history'
 import { makeByteBoundedMemo } from './sanitize-memo'
 import {
@@ -1233,6 +1234,7 @@ export async function rewriteRequestBody(
     thinkingPrefixMismatchBehavior?: ThinkingPrefixMismatchBehavior
     midConversationEffortEnabled?: boolean
     midConversationEffortPlan?: string
+    midConversationEffortResolvedPlan?: OpenCodeEffortMarkerPlan
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
@@ -1306,6 +1308,7 @@ export async function rewriteRequestBody(
       parsed,
       options.midConversationEffortEnabled === true,
       options.midConversationEffortPlan,
+      options.midConversationEffortResolvedPlan,
     )
     applyThinkingBindingControls(
       parsed,
