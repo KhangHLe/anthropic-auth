@@ -4,6 +4,11 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ## Unreleased
 
+### Minor Changes
+
+- Document the global `/claude-account claustrum|local` custody mode, including its fail-closed OpenCode behavior and Pi refusal.
+- Document global Claustrum manifest onboarding, startup legacy-handle migration, and vault re-login recovery.
+
 ### Patch Changes
 
 - Keep OpenCode's request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.

@@ -4,7 +4,13 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 import { parseRetryAfterHeader, refreshClaudeOAuthToken } from './auth.ts'
-import { CustodyTombstoneRefreshError } from './claustrum.ts'
+import type { ProviderAccountUuid } from './claude-code.ts'
+import {
+  assertNotCustodyTombstone,
+  type CustodyHandleResolution,
+  CustodyTombstoneRefreshError,
+  custodyTombstoneKey,
+} from './claustrum.ts'
 import {
   CACHE_1H_MODES,
   type Cache1hMode,
@@ -15,6 +21,8 @@ import { parseJsonRedacted } from './json.ts'
 import { type LogLevel, log, logger } from './logger.ts'
 import { isTransientNetworkError } from './network-errors.ts'
 import { tokenFingerprint } from './token-fingerprint.ts'
+
+export type { ProviderAccountUuid } from './claude-code.ts'
 
 const setRefreshLockRenewalTimeout = globalThis.setTimeout.bind(globalThis)
 const clearRefreshLockRenewalTimeout = globalThis.clearTimeout.bind(globalThis)
@@ -49,7 +57,10 @@ export type AccountBase = {
 export type OAuthAccount = AccountBase & {
   type: 'oauth'
   authLineageId?: string
-  anthropicAccountUuid?: string
+  // Persisted under this name on both fallback accounts and the main profile because the
+  // quota feed schema owns the anthropicAccountUuid key; only the branded type and the
+  // request-scoped identity variables use the provider-neutral providerAccountUuid name.
+  anthropicAccountUuid?: ProviderAccountUuid
   claustrumHandle?: string
   access?: string
   refresh: string
@@ -66,6 +77,16 @@ export type OAuthAccount = AccountBase & {
   prime?: PrimeUsageCounters
 }
 
+export function hasNoLocalCredential(account: {
+  access?: unknown
+  refresh?: unknown
+}): boolean {
+  return (
+    account.access == null &&
+    (account.refresh == null || account.refresh === '')
+  )
+}
+
 export type ApiKeyAccount = AccountBase & {
   type: 'api'
   apiKey?: string
@@ -79,7 +100,12 @@ export type ClaustrumAccountGate = {
   enabled?: boolean
 }
 
+export type ClaustrumMode = 'local' | 'claustrum'
+
 export type ClaustrumConfig = {
+  mode?: ClaustrumMode
+  handlesFile?: string
+  // Kept loadable so configurations remain safe to downgrade to older releases.
   accounts?: Record<string, ClaustrumAccountGate>
 }
 
@@ -171,6 +197,7 @@ export type OAuthAccountProfile = {
   checkedAt: number
   /** Stable account identity; tokenFingerprint remains loadable for legacy state. */
   accountIdentity?: string
+  providerAccountUuid?: ProviderAccountUuid
   tokenFingerprint?: string
 }
 
@@ -387,6 +414,7 @@ export type AccountStateSaveScope = {
   mainRefresh?: boolean
   mainPrime?: boolean
   accounts?: true | string[]
+  setClaustrumHandleAccountIds?: readonly string[]
 }
 
 type OAuthUsageWindow = {
@@ -544,7 +572,15 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
   }
 
   if (value.type !== 'oauth') return null
-  if (typeof value.refresh !== 'string' || !value.refresh.trim()) return null
+  const refresh = typeof value.refresh === 'string' ? value.refresh : ''
+  const rosterOnly =
+    value.enabled === true &&
+    typeof value.id === 'string' &&
+    Boolean(value.id.trim()) &&
+    typeof value.label === 'string' &&
+    Boolean(value.label.trim()) &&
+    hasNoLocalCredential(value)
+  if (!refresh.trim() && !rosterOnly) return null
 
   return {
     ...normalizeAccountBase(value),
@@ -553,17 +589,17 @@ function normalizeAccount(value: unknown): FallbackAccount | null {
       typeof value.authLineageId === 'string' && value.authLineageId.trim()
         ? value.authLineageId
         : undefined,
+    anthropicAccountUuid:
+      typeof value.anthropicAccountUuid === 'string' &&
+      value.anthropicAccountUuid.trim()
+        ? (value.anthropicAccountUuid.trim() as ProviderAccountUuid)
+        : undefined,
     claustrumHandle:
       typeof value.claustrumHandle === 'string' && value.claustrumHandle.trim()
         ? value.claustrumHandle.trim()
         : undefined,
-    anthropicAccountUuid:
-      typeof value.anthropicAccountUuid === 'string' &&
-      value.anthropicAccountUuid.trim()
-        ? value.anthropicAccountUuid.trim()
-        : undefined,
     access: typeof value.access === 'string' ? value.access : undefined,
-    refresh: value.refresh,
+    refresh,
     expires: typeof value.expires === 'number' ? value.expires : undefined,
     lastRefreshedAt:
       typeof value.lastRefreshedAt === 'number'
@@ -598,6 +634,11 @@ function normalizeOAuthAccountProfile(
     ...(typeof value.accountIdentity === 'string' &&
       value.accountIdentity.trim() && {
         accountIdentity: value.accountIdentity.trim(),
+      }),
+    ...(typeof value.providerAccountUuid === 'string' &&
+      value.providerAccountUuid.trim() && {
+        providerAccountUuid:
+          value.providerAccountUuid.trim() as ProviderAccountUuid,
       }),
     ...(typeof value.tokenFingerprint === 'string' &&
       value.tokenFingerprint.trim() && {
@@ -900,23 +941,44 @@ function normalizeStorage(value: unknown): AccountStorage | null {
 }
 
 function normalizeClaustrumConfig(value: unknown): ClaustrumConfig | undefined {
-  if (!isRecord(value) || !isRecord(value.accounts)) return undefined
-  const accounts = Object.fromEntries(
-    Object.entries(value.accounts).flatMap(([id, entry]) => {
-      if (!isRecord(entry)) return []
-      return [
-        [
-          id,
-          {
-            ...(typeof entry.enabled === 'boolean' && {
-              enabled: entry.enabled,
-            }),
-          },
-        ],
-      ]
-    }),
-  )
-  return Object.keys(accounts).length > 0 ? { accounts } : undefined
+  if (!isRecord(value)) return undefined
+  const mode: ClaustrumMode | undefined =
+    value.mode === 'local' || value.mode === 'claustrum'
+      ? value.mode
+      : undefined
+  const handlesFile =
+    typeof value.handlesFile === 'string' && value.handlesFile.trim()
+      ? value.handlesFile.trim()
+      : undefined
+  const accounts = isRecord(value.accounts)
+    ? Object.fromEntries(
+        Object.entries(value.accounts).flatMap(([id, entry]) => {
+          if (!isRecord(entry)) return []
+          return [
+            [
+              id,
+              {
+                ...(typeof entry.enabled === 'boolean' && {
+                  enabled: entry.enabled,
+                }),
+              },
+            ],
+          ]
+        }),
+      )
+    : undefined
+  if (
+    !mode &&
+    !handlesFile &&
+    (!accounts || Object.keys(accounts).length === 0)
+  ) {
+    return undefined
+  }
+  return {
+    ...(mode && { mode }),
+    ...(handlesFile && { handlesFile }),
+    ...(accounts && Object.keys(accounts).length > 0 && { accounts }),
+  }
 }
 
 async function readJsonIfPresent(path: string): Promise<{
@@ -1359,30 +1421,54 @@ export function mergeHeaderQuotaForPersistence(
 function mergeAccountRuntimeState(
   existing: unknown,
   incoming: AccountRuntimeEntry,
+  setClaustrumHandle = false,
 ): AccountRuntimeEntry {
   if (!isRecord(existing)) return incoming
+  const incomingForMerge = { ...incoming }
+  if (!setClaustrumHandle) delete incomingForMerge.claustrumHandle
   const existingEntry = existing as AccountRuntimeEntry
   const tokenChanged = Boolean(
     (existingEntry.access &&
-      incoming.access &&
-      existingEntry.access !== incoming.access) ||
+      incomingForMerge.access &&
+      existingEntry.access !== incomingForMerge.access) ||
       (existingEntry.refresh &&
-        incoming.refresh &&
-        existingEntry.refresh !== incoming.refresh),
+        incomingForMerge.refresh &&
+        existingEntry.refresh !== incomingForMerge.refresh),
   )
   const mergesHeaderQuota = Boolean(
-    !tokenChanged && incoming.quota?.source === 'headers',
+    !tokenChanged && incomingForMerge.quota?.source === 'headers',
   )
   const effectiveIncoming =
-    mergesHeaderQuota && incoming.quota
+    mergesHeaderQuota && incomingForMerge.quota
       ? {
-          ...incoming,
+          ...incomingForMerge,
           quota: mergeHeaderQuotaForPersistence(
             existingEntry.quota,
-            incoming.quota,
+            incomingForMerge.quota,
           ),
         }
-      : incoming
+      : incomingForMerge
+  if (
+    existingEntry.refresh === custodyTombstoneKey('anthropic') &&
+    ((typeof effectiveIncoming.access === 'string' &&
+      effectiveIncoming.access.length > 0) ||
+      (typeof effectiveIncoming.refresh === 'string' &&
+        effectiveIncoming.refresh !== custodyTombstoneKey('anthropic'))) &&
+    (!effectiveIncoming.authLineageId ||
+      effectiveIncoming.authLineageId === existingEntry.authLineageId)
+  ) {
+    logger.warn(
+      'accounts',
+      'discarded stale credential write over a custody tombstone',
+    )
+    const {
+      access: _access,
+      refresh: _refresh,
+      expires: _expires,
+      ...safe
+    } = effectiveIncoming
+    return mergeAccountRuntimeState(existingEntry, safe, setClaustrumHandle)
+  }
   const preferredRefreshError = (() => {
     const existingError = existingEntry.lastRefreshError
     const incomingError = effectiveIncoming.lastRefreshError
@@ -1514,11 +1600,104 @@ function configFromStorage(storage: AccountStorage): Record<string, unknown> {
   })
 }
 
-export function isClaustrumEnabledForAccount(
-  storage: AccountStorage,
-  accountId: string,
+export function getClaustrumMode(
+  storage: AccountStorage | null,
+): ClaustrumMode {
+  return storage?.claustrum?.mode === 'claustrum' ? 'claustrum' : 'local'
+}
+
+export function isOAuthAccountVaultOwned(
+  storage: AccountStorage | null,
+  account: FallbackAccount,
+  binding: CustodyHandleResolution | undefined,
 ): boolean {
-  return storage.claustrum?.accounts?.[accountId]?.enabled === true
+  return (
+    getClaustrumMode(storage) === 'claustrum' &&
+    isOAuthAccount(account) &&
+    account.enabled !== false &&
+    // Source is provenance, not authorization; the resolver owns the binding decision.
+    binding?.status === 'resolved'
+  )
+}
+
+export async function setClaustrumModePersistent(
+  mode: ClaustrumMode,
+  path = getAccountStoragePath(),
+): Promise<'changed' | 'unchanged'> {
+  return enqueueSave(async () => {
+    const lock = await acquireAccountConfigWriteLock(path)
+    try {
+      const existing = await loadAccounts(path)
+      const storage = existing ?? createEmptyStorage()
+      if (existing && getClaustrumMode(storage) === mode) return 'unchanged'
+      storage.claustrum = { ...storage.claustrum, mode }
+      await saveAccountsWithConfigLock(storage, path, {
+        [WRITE_CLAUSTRUM_MODE]: true,
+      })
+      return 'changed'
+    } finally {
+      await lock.release()
+    }
+  })
+}
+
+export async function clearClaustrumHandlePersistent(input: {
+  id: string
+  path?: string
+}): Promise<'updated' | 'missing' | 'ineligible'> {
+  const path = input.path ?? getAccountStoragePath()
+  return enqueueSave(async () => {
+    const configLock = await acquireAccountConfigWriteLock(path)
+    try {
+      const stateLock = await acquireAccountStateWriteLock(path)
+      try {
+        const storage = await loadAccounts(path)
+        if (!storage) return 'missing'
+        const statePath = getAccountStatePath(path)
+        const state = (await readJsonIfPresent(statePath)).value
+        const stateAccounts =
+          isRecord(state) && isRecord(state.accounts)
+            ? state.accounts
+            : undefined
+        const matchingStateKeys = Object.keys(stateAccounts ?? {}).filter(
+          (key) => key.trim() === input.id.trim(),
+        )
+        const account = storage.accounts.find(
+          (candidate) => candidate.id === input.id,
+        )
+        if (!account) {
+          if (matchingStateKeys.length === 0) return 'missing'
+          for (const key of matchingStateKeys) {
+            const stateAccount = stateAccounts?.[key]
+            if (isRecord(stateAccount)) delete stateAccount.claustrumHandle
+          }
+          await writeJsonAtomic(statePath, pruneUndefined(state))
+          return 'updated'
+        }
+        if (!isOAuthAccount(account)) return 'ineligible'
+        if (!account.claustrumHandle) return 'updated'
+
+        delete account.claustrumHandle
+        const existing = await loadExistingTopLevelFields(path)
+        await writeJsonAtomic(path, {
+          ...existing,
+          ...configFromStorage(storage),
+        })
+        if (matchingStateKeys.length > 0) {
+          for (const key of matchingStateKeys) {
+            const stateAccount = stateAccounts?.[key]
+            if (isRecord(stateAccount)) delete stateAccount.claustrumHandle
+          }
+          await writeJsonAtomic(statePath, pruneUndefined(state))
+        }
+        return 'updated'
+      } finally {
+        await stateLock.release()
+      }
+    } finally {
+      await configLock.release()
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -1552,11 +1731,18 @@ async function writeJsonAtomic(path: string, value: unknown) {
   }
 }
 
+const WRITE_CLAUSTRUM_MODE = Symbol('writeClaustrumMode')
+
 export interface SaveAccountsOptions {
   /** Account ids intentionally removed by this mutation. */
   removedAccountIds?: readonly string[]
   /** Preserve disk order when a stale snapshot is missing newer accounts. */
   preserveExistingAccountOrder?: boolean
+  setClaustrumHandleAccountIds?: readonly string[]
+}
+
+type InternalSaveAccountsOptions = SaveAccountsOptions & {
+  [WRITE_CLAUSTRUM_MODE]?: true
 }
 
 function sameAccountIdentity(
@@ -1691,36 +1877,61 @@ export async function getOrCreateMainAccountId(
 async function saveAccountsLocked(
   storage: AccountStorage,
   path: string,
-  options: SaveAccountsOptions,
+  options: InternalSaveAccountsOptions,
 ) {
   const lock = await acquireAccountConfigWriteLock(path)
   try {
-    const current = await loadAccounts(path)
-    const nextStorage: AccountStorage = {
-      ...storage,
-      accounts: mergeAccountsForSave(
-        current?.accounts ?? [],
-        storage.accounts,
-        options,
-      ),
-    }
-    const existing = await loadExistingTopLevelFields(path)
-    const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
-    await writeJsonAtomic(path, nextConfig)
-    // Config precedes state everywhere both locks are needed; reversing this
-    // order can deadlock profile mutations against full account saves.
-    const stateLock = await acquireAccountStateWriteLock(path)
-    try {
-      await saveAccountStateUnlocked(nextStorage, path, {
-        mainQuota: true,
-        mainRefresh: true,
-        accounts: true,
-      })
-    } finally {
-      await stateLock.release()
-    }
+    await saveAccountsWithConfigLock(storage, path, options)
   } finally {
     await lock.release()
+  }
+}
+
+async function saveAccountsWithConfigLock(
+  storage: AccountStorage,
+  path: string,
+  options: InternalSaveAccountsOptions,
+) {
+  const current = await loadAccounts(path)
+  const nextStorage: AccountStorage = {
+    ...storage,
+    ...(storage.claustrum && {
+      claustrum: {
+        ...current?.claustrum,
+        ...storage.claustrum,
+        ...(options[WRITE_CLAUSTRUM_MODE]
+          ? { mode: storage.claustrum.mode }
+          : current?.claustrum?.mode
+            ? { mode: current.claustrum.mode }
+            : {}),
+      },
+    }),
+    ...(!storage.claustrum &&
+      current?.claustrum && {
+        claustrum: current.claustrum,
+      }),
+    accounts: mergeAccountsForSave(
+      current?.accounts ?? [],
+      storage.accounts,
+      options,
+    ),
+  }
+  const existing = await loadExistingTopLevelFields(path)
+  const nextConfig = { ...existing, ...configFromStorage(nextStorage) }
+  if (!nextStorage.claustrum) delete nextConfig.claustrum
+  await writeJsonAtomic(path, nextConfig)
+  // Config precedes state everywhere both locks are needed; reversing this
+  // order can deadlock profile mutations against full account saves.
+  const stateLock = await acquireAccountStateWriteLock(path)
+  try {
+    await saveAccountStateUnlocked(nextStorage, path, {
+      mainQuota: true,
+      mainRefresh: true,
+      accounts: true,
+      setClaustrumHandleAccountIds: options.setClaustrumHandleAccountIds,
+    })
+  } finally {
+    await stateLock.release()
   }
 }
 
@@ -2113,7 +2324,6 @@ export function clearClaustrumRefreshErrorPersistent(
           !storage ||
           !account ||
           account.claustrumHandle !== handle ||
-          !isClaustrumEnabledForAccount(storage, accountId) ||
           !account.lastRefreshError
         ) {
           return false
@@ -2157,6 +2367,9 @@ async function saveAccountStateUnlocked(
 
   if (scope.accounts) {
     const ids = scope.accounts === true ? null : new Set(scope.accounts)
+    const setClaustrumHandleAccountIds = new Set(
+      scope.setClaustrumHandleAccountIds ?? [],
+    )
     const config = (await readJsonIfPresent(path)).value
     const configuredIds = (() => {
       if (!isRecord(config) || !Array.isArray(config.accounts)) return null
@@ -2214,6 +2427,8 @@ async function saveAccountStateUnlocked(
       next.accounts[accountId] = mergeAccountRuntimeState(
         existingAccount,
         accountRuntimeState(account),
+        setClaustrumHandleAccountIds.has(account.id) ||
+          setClaustrumHandleAccountIds.has(accountId),
       )
     }
     if (configuredIds) {
@@ -3386,7 +3601,12 @@ export async function addAccountPersistent(
 ) {
   const storage = (await loadAccounts(path)) ?? createEmptyStorage()
   upsertAccount(storage, account)
-  await saveAccounts(storage, path)
+  await saveAccounts(storage, path, {
+    setClaustrumHandleAccountIds:
+      account.type === 'oauth' && account.claustrumHandle
+        ? [account.id]
+        : undefined,
+  })
 }
 
 export function getQuotaNextRefreshAt(
@@ -3649,6 +3869,7 @@ export async function fetchOAuthQuotaSnapshot(input: {
   fetchImpl?: typeof fetch
   now?: () => number
 }): Promise<OAuthQuotaSnapshot> {
+  assertNotCustodyTombstone(input.accessToken, 'anthropic')
   const fetchImpl = input.fetchImpl ?? fetch
   const response = await fetchImpl(QUOTA_URL, {
     method: 'GET',
@@ -3740,6 +3961,10 @@ export function upsertAccount(
       }),
     }
     if (lineageChanged && updated.type === 'oauth') {
+      logger.debug(
+        'accounts',
+        'cleared provider UUID after auth lineage change',
+      )
       delete updated.anthropicAccountUuid
     }
     storage.accounts[index] = updated
@@ -3753,7 +3978,7 @@ export function persistFallbackQuotaHeaderPersistent(
     accountId: string
     authLineageId?: string
     quota: OAuthQuotaSnapshot
-    anthropicAccountUuid?: string
+    anthropicAccountUuid?: ProviderAccountUuid
   },
   path = getAccountStoragePath(),
 ): Promise<boolean> {
@@ -3882,6 +4107,7 @@ export class FallbackAccountManager {
   private readonly fetchImpl: typeof fetch
   private readonly configPath: string
   private readonly refreshPromises = new Map<string, Promise<OAuthAccount>>()
+  private readonly custodyVerificationAccounts = new Set<string>()
   private refreshTimer: ReturnType<typeof setInterval> | null = null
   private quotaTimer: ReturnType<typeof setInterval> | null = null
   readonly quotaManager: import('./quota-manager.ts').QuotaManager | null
@@ -3992,6 +4218,27 @@ export class FallbackAccountManager {
     this.quotaTimer = null
   }
 
+  async withAccountRefreshLock<T>(
+    accountId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const lock = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName(accountId),
+      ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+      path: this.configPath,
+      now: this.now,
+      renew: true,
+    })
+    if (!lock) throw new Error('Fallback OAuth refresh is already in progress')
+    this.custodyVerificationAccounts.add(accountId)
+    try {
+      return await fn()
+    } finally {
+      this.custodyVerificationAccounts.delete(accountId)
+      await lock.release()
+    }
+  }
+
   async getUsableFallbackAccounts(
     existingStorage?: AccountStorage | null,
     options: { modelId?: string } = {},
@@ -4004,21 +4251,24 @@ export class FallbackAccountManager {
 
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (this.isFallbackAccountVaultEnabled(account.id, storage)) {
+        if (!this.isFallbackAccountVaultServed(account.id, storage)) continue
+        if (
+          hasNoLocalCredential(account) &&
+          !storage.quota?.minimumRemaining &&
+          !isKillswitchEnabled(storage)
+        ) {
+          usable.push(account)
+          continue
+        }
+      }
       let next = account
       try {
         if (
           tokenNeedsRefresh(next, storage, this.now()) &&
-          (!this.isFallbackAccountVaultEnabled(next.id, storage) ||
-            next.expires === undefined ||
-            next.expires <= this.now()) &&
+          !this.isFallbackAccountVaultEnabled(next.id, storage) &&
           !this.isFallbackAccountVaultServed(next.id, storage)
         ) {
-          if (this.isFallbackAccountVaultEnabled(next.id, storage)) {
-            logger.warn('refresh', 'custody override: local fallback refresh', {
-              accountId: next.id,
-              reason: 'vault credential unavailable',
-            })
-          }
           const refreshError = next.lastRefreshError
           if (
             refreshError &&
@@ -4149,6 +4399,16 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (this.custodyVerificationAccounts.has(account.id)) {
+        logger.debug(
+          'refresh',
+          'fallback OAuth background skipped vault-service verification',
+          {
+            accountId: account.id,
+          },
+        )
+        continue
+      }
       if (
         !tokenNeedsRefresh(account, storage, this.now()) ||
         this.isFallbackAccountVaultEnabled(account.id, storage) ||
@@ -4199,6 +4459,7 @@ export class FallbackAccountManager {
     let changed = false
     for (const account of storage.accounts) {
       if (account.enabled === false || !isOAuthAccount(account)) continue
+      if (this.custodyVerificationAccounts.has(account.id)) continue
       let next = account
       try {
         if (
@@ -4306,7 +4567,11 @@ export class FallbackAccountManager {
     storage: AccountStorage,
     options: { force?: boolean; persistError?: boolean } = {},
   ): Promise<OAuthAccount> {
-    if (this.isFallbackAccountVaultServed(account.id, storage)) return account
+    if (
+      this.isFallbackAccountVaultServed(account.id, storage) ||
+      this.isFallbackAccountVaultEnabled(account.id, storage)
+    )
+      return account
     const existing = this.refreshPromises.get(account.id)
     if (existing) {
       const refreshed = await existing
@@ -4505,6 +4770,21 @@ export class FallbackAccountManager {
         changed,
       }
     }
+    let quotaPollLock = await acquireRefreshFileLock({
+      name: fallbackRefreshLockName(target.id),
+      ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+      path: this.configPath,
+      now: this.now,
+    })
+    if (!quotaPollLock) {
+      log('[quota] fallback quota poll skipped refresh lock', {
+        accountId: target.id,
+      })
+      return { account: target, fetched: false, changed }
+    }
+    await using _quotaPollLock = {
+      [Symbol.asyncDispose]: async () => quotaPollLock?.release(),
+    }
     // Unify on the shared QuotaManager when present: it adds inflight
     // deduplication and 429 backoff gating around the same quota API. Fall back
     // to a direct fetch only when no QuotaManager is wired (e.g. in isolation).
@@ -4535,6 +4815,8 @@ export class FallbackAccountManager {
       ) {
         throw error
       }
+      await quotaPollLock.release()
+      quotaPollLock = null
       target = await this.refreshAccount(account, storage, {
         force: true,
       })
@@ -4552,6 +4834,18 @@ export class FallbackAccountManager {
           fetched: false,
           changed,
         }
+      }
+      quotaPollLock = await acquireRefreshFileLock({
+        name: fallbackRefreshLockName(target.id),
+        ttlMs: FALLBACK_REFRESH_LOCK_TTL_MS,
+        path: this.configPath,
+        now: this.now,
+      })
+      if (!quotaPollLock) {
+        log('[quota] fallback quota poll skipped refresh lock', {
+          accountId: target.id,
+        })
+        return { account: target, fetched: false, changed }
       }
       // 401 does not arm QuotaManager backoff, so this retry proceeds.
       const result = await fetchSnapshot(access.token)

@@ -190,7 +190,7 @@ async function createFixture(
             : {}),
         }
       : { enabled: false, failClosedOnUnknownQuota: false },
-    claustrum: { accounts: { [accountId]: { enabled: true } } },
+    claustrum: { mode: 'claustrum' },
     ...(options.prime ? { prime: { enabled: true } } : {}),
     ...(options.cachekeep || options.recovery
       ? {

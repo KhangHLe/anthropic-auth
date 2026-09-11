@@ -19,6 +19,8 @@ import {
   buildQuotaOperationError,
   buildRefreshOperationError,
   ClaudeOAuthRefreshError,
+  clearClaustrumHandlePersistent,
+  custodyTombstoneKey,
   FallbackAccountManager,
   fallbackAccountUuidForLineage,
   fetchOAuthAccountProfile,
@@ -26,6 +28,7 @@ import {
   formatOAuthAccountTier,
   getAccountStatePath,
   getCache1hPersistentMode,
+  getClaustrumMode,
   getFallbackReauthLabels,
   getLogLevel,
   getOrCreateMainAccountId,
@@ -37,6 +40,7 @@ import {
   isCacheKeepSubagentsEnabled,
   isCostZeroingEnabled,
   isFastModePersistentlyEnabled,
+  isOAuthAccountVaultOwned,
   isPermanentRefreshError,
   isPrimePersistentlyEnabled,
   type KillswitchThresholds,
@@ -51,6 +55,7 @@ import {
   type OAuthQuotaSnapshot,
   oauthProfileIsFresh,
   PROFILE_TTL_MS,
+  type ProviderAccountUuid,
   persistFallbackQuotaHeaderPersistent,
   QuotaManager,
   quotaFieldSource,
@@ -73,6 +78,7 @@ import {
   setCacheKeepPersistentEnabled,
   setCacheKeepPersistentWindow,
   setCacheKeepSubagentsEnabled,
+  setClaustrumModePersistent,
   setFastModePersistentEnabled,
   setLogLevel,
   setLogLevelPersistent,
@@ -81,6 +87,8 @@ import {
   tokenFingerprint,
   upsertAccount,
 } from '@cortexkit/anthropic-auth-core'
+
+const providerUuid = (value: string) => value as ProviderAccountUuid
 
 let tempDir: string
 let accountPath: string
@@ -306,6 +314,107 @@ describe('scoped account-state membership', () => {
   })
 })
 
+describe('custody account-state persistence', () => {
+  test('a stale refresh snapshot cannot replace a custody tombstone with real material', async () => {
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work',
+            label: 'work',
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+            expires: 1_700_000_100_000,
+            authLineageId: 'refresh-lineage',
+          },
+        ],
+      },
+      accountPath,
+    )
+    const staleRefresh = (await loadAccounts(accountPath))!
+    const takeover = (await loadAccounts(accountPath))!
+    const tombstoned = expectOAuthAccount(
+      takeover.accounts.find((account) => account.id === 'work'),
+    )
+    tombstoned.access = ''
+    tombstoned.refresh = custodyTombstoneKey('anthropic')
+    tombstoned.expires = 0
+    await saveAccountState(takeover, accountPath, { accounts: ['work'] })
+
+    const stale = expectOAuthAccount(
+      staleRefresh.accounts.find((account) => account.id === 'work'),
+    )
+    stale.access = 'late-access'
+    stale.refresh = 'late-refresh'
+    stale.expires = 1_700_000_200_000
+    const logs: LogTestRecord[] = []
+    try {
+      __setLogTestSink((record) => logs.push(record))
+      await saveAccountState(staleRefresh, accountPath, { accounts: ['work'] })
+    } finally {
+      __setLogTestSink(null)
+    }
+
+    const persisted = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(persisted.accounts.work).toMatchObject({
+      access: '',
+      refresh: custodyTombstoneKey('anthropic'),
+      expires: 0,
+    })
+    expect(logs).toContainEqual(
+      expect.objectContaining({
+        level: 'warn',
+        message: 'discarded stale credential write over a custody tombstone',
+      }),
+    )
+  })
+
+  test('an unattributed credential writer cannot replace a custody tombstone', async () => {
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work',
+            label: 'work',
+            type: 'oauth',
+            access: 'old-access',
+            refresh: 'old-refresh',
+          },
+        ],
+      },
+      accountPath,
+    )
+    const unattributed = (await loadAccounts(accountPath))!
+    await writeFile(
+      getAccountStatePath(accountPath),
+      JSON.stringify({
+        version: 1,
+        accounts: {
+          work: {
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+          },
+        },
+      }),
+    )
+    await saveAccountState(unattributed, accountPath, { accounts: ['work'] })
+    const persisted = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(persisted.accounts.work).toMatchObject({
+      access: '',
+      refresh: custodyTombstoneKey('anthropic'),
+      expires: 0,
+    })
+  })
+})
+
 describe('main quota clear marker', () => {
   test('keeps the newer marker when an older marker arrives', () => {
     expect(mergeMainQuotaErrorClearedAt(2_000, 1_000)).toBe(2_000)
@@ -467,6 +576,72 @@ afterEach(async () => {
   delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   await rm(tempDir, { recursive: true, force: true })
   mock.restore()
+})
+
+describe('fallback quota polling', () => {
+  test('skips an account held by custody verification in another manager', async () => {
+    await saveAccounts(
+      {
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work',
+            type: 'oauth',
+            access: 'work-access',
+            refresh: 'work-refresh',
+            expires: Date.now() + 60 * 60 * 1_000,
+          },
+        ],
+      },
+      accountPath,
+    )
+
+    let quotaRequests = 0
+    const verifying = new FallbackAccountManager({ configPath: accountPath })
+    const polling = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl: (async () => {
+        quotaRequests += 1
+        return Response.json({
+          five_hour: { utilization: 10 },
+          seven_day: { utilization: 10 },
+        })
+      }) as unknown as typeof fetch,
+    })
+    const lockEntered = deferred()
+    const releaseLock = deferred()
+    const verification = verifying.withAccountRefreshLock('work', async () => {
+      lockEntered.resolve()
+      await releaseLock.promise
+    })
+    await lockEntered.promise
+
+    const lockedStorage = (await loadAccounts(accountPath))!
+    const skipped = await polling.refreshAccountQuota(
+      expectOAuthAccount(lockedStorage.accounts[0]),
+      lockedStorage,
+    )
+    if (skipped.changed) await polling.save(lockedStorage)
+    expect(skipped.fetched).toBe(false)
+    expect(quotaRequests).toBe(0)
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0]).quota,
+    ).toBeUndefined()
+
+    releaseLock.resolve()
+    await verification
+    const unlockedStorage = (await loadAccounts(accountPath))!
+    const fetched = await polling.refreshAccountQuota(
+      expectOAuthAccount(unlockedStorage.accounts[0]),
+      unlockedStorage,
+    )
+    if (fetched.changed) await polling.save(unlockedStorage)
+    expect(fetched.fetched).toBe(true)
+    expect(quotaRequests).toBe(1)
+    expect(
+      expectOAuthAccount((await loadAccounts(accountPath))?.accounts[0]).quota,
+    ).toBeDefined()
+  })
 })
 
 describe('OAuth account profiles', () => {
@@ -3758,6 +3933,65 @@ describe('FallbackAccountManager', () => {
     expect(expectOAuthAccount(saved?.accounts[0]).refresh).toBe('new-refresh')
   })
 
+  test('background refresh skips a custody verification lock without warning', async () => {
+    const storage = baseStorage()
+    storage.accounts.push({
+      id: 'custody-verifying',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: Date.now() + 60_000,
+    })
+    await saveAccounts(storage, accountPath)
+    const logs: LogTestRecord[] = []
+    const previousLogLevel = getLogLevel()
+    const entered = deferred()
+    const release = deferred()
+    const fetchImpl = mock(() =>
+      Promise.resolve(new Response(null, { status: 200 })),
+    ) as unknown as typeof fetch
+    const manager = new FallbackAccountManager({
+      configPath: accountPath,
+      fetchImpl,
+    })
+
+    try {
+      setLogLevel('debug')
+      __setLogTestSink((record) => logs.push(record))
+      const held = manager.withAccountRefreshLock(
+        'custody-verifying',
+        async () => {
+          entered.resolve()
+          await release.promise
+        },
+      )
+      await entered.promise
+
+      await manager.refreshDueAccounts()
+      await manager.refreshQuotaForDueAccounts()
+
+      expect(fetchImpl).not.toHaveBeenCalled()
+      expect(logs).toContainEqual(
+        expect.objectContaining({
+          level: 'debug',
+          channel: 'refresh',
+          message:
+            'fallback OAuth background skipped vault-service verification',
+        }),
+      )
+      expect(
+        logs.some(
+          (record) => record.level === 'warn' || record.level === 'error',
+        ),
+      ).toBe(false)
+      release.resolve()
+      await held
+    } finally {
+      __setLogTestSink(null)
+      setLogLevel(previousLogLevel)
+    }
+  })
+
   test('background fallback refresh retries after a permanent backoff belongs to an older refresh token', async () => {
     const now = Date.now()
     const storage = baseStorage()
@@ -6459,7 +6693,7 @@ describe('upsertAccount', () => {
       type: 'oauth',
       refresh: 'refresh-a',
       authLineageId: 'lineage-a',
-      anthropicAccountUuid: 'uuid-from-lineage-a',
+      anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
     })
 
     upsertAccount(storage, {
@@ -6481,7 +6715,7 @@ describe('upsertAccount', () => {
       type: 'oauth',
       refresh: 'refresh-a',
       authLineageId: 'lineage-a',
-      anthropicAccountUuid: 'uuid-from-lineage-a',
+      anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
     })
 
     upsertAccount(storage, {
@@ -6492,7 +6726,7 @@ describe('upsertAccount', () => {
     })
 
     expect((storage.accounts[0] as OAuthAccount).anthropicAccountUuid).toBe(
-      'uuid-from-lineage-a',
+      providerUuid('uuid-from-lineage-a'),
     )
   })
 })
@@ -6504,7 +6738,7 @@ describe('fallback UUID lineage fences', () => {
       type: 'oauth',
       refresh: 'refresh-a',
       authLineageId: 'lineage-a',
-      anthropicAccountUuid: 'uuid-from-lineage-a',
+      anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
     }
 
     expect(fallbackAccountUuidForLineage(account, 'lineage-b')).toBeNull()
@@ -6534,7 +6768,7 @@ describe('fallback UUID lineage fences', () => {
         {
           accountId: 'fallback-1',
           authLineageId: 'lineage-a',
-          anthropicAccountUuid: 'uuid-from-lineage-a',
+          anthropicAccountUuid: providerUuid('uuid-from-lineage-a'),
           quota: {
             source: 'headers',
             checkedAt: 1_000,
@@ -6883,6 +7117,311 @@ describe('setAccountEnabledPersistent', () => {
     )
     const loaded = await loadAccounts()
     expect(loaded?.accounts[0]?.enabled).toBe(false)
+  })
+})
+
+describe('global Claustrum mode', () => {
+  test('defaults to local without config and does not infer custody from a tombstone', async () => {
+    expect(await loadAccounts(accountPath)).toBeNull()
+    expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('local')
+    expect(
+      getClaustrumMode({
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'anthropic',
+            type: 'oauth',
+            access: '',
+            refresh: 'claustrum-tombstone:v1:anthropic',
+            expires: 0,
+          },
+        ],
+      }),
+    ).toBe('local')
+  })
+
+  test('loads legacy custody gates as local and preserves them through save', async () => {
+    const legacyAccounts = { 'work-alt': { enabled: true } }
+    await writeFile(
+      accountPath,
+      JSON.stringify({
+        ...baseStorage(),
+        accounts: [
+          {
+            id: 'work-alt',
+            type: 'oauth',
+            refresh: 'refresh-token',
+            enabled: true,
+          },
+        ],
+        claustrum: { accounts: legacyAccounts },
+      }),
+      'utf8',
+    )
+
+    const loaded = await loadAccounts(accountPath)
+    expect(getClaustrumMode(loaded)).toBe('local')
+    expect(
+      isOAuthAccountVaultOwned(
+        loaded!,
+        expectOAuthAccount(loaded?.accounts[0]),
+        {
+          status: 'resolved',
+          source: 'manifest',
+          handle: 'manifest-handle',
+          credentialId: 'anthropic:work-alt',
+        },
+      ),
+    ).toBe(false)
+    await saveAccounts(loaded!, accountPath)
+
+    expect(
+      JSON.parse(await readFile(accountPath, 'utf8')).claustrum.accounts,
+    ).toEqual(legacyAccounts)
+  })
+
+  test('defaults invalid persisted global modes to local', async () => {
+    for (const mode of ['vault', 42, null]) {
+      await writeFile(
+        accountPath,
+        JSON.stringify({ ...baseStorage(), claustrum: { mode } }),
+        'utf8',
+      )
+      const loaded = await loadAccounts(accountPath)
+      expect(getClaustrumMode(loaded)).toBe('local')
+      await saveAccounts(loaded!, accountPath)
+      expect(
+        JSON.parse(await readFile(accountPath, 'utf8')).claustrum?.mode,
+      ).toBeUndefined()
+    }
+  })
+
+  test('persists global mode in config and retains it through a state save', async () => {
+    const storage = baseStorage()
+    storage.claustrum = { mode: 'local' }
+    storage.accounts.push({
+      id: 'rotation',
+      type: 'oauth',
+      access: 'old-access',
+      refresh: 'old-refresh',
+      expires: 1_000,
+    })
+    await saveAccounts(storage, accountPath)
+
+    const staleStorage = (await loadAccounts(accountPath))!
+
+    expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
+      'changed',
+    )
+    expect(await setClaustrumModePersistent('claustrum', accountPath)).toBe(
+      'unchanged',
+    )
+    expect(getClaustrumMode(await loadAccounts(accountPath))).toBe('claustrum')
+
+    const account = expectOAuthAccount(staleStorage.accounts[0])
+    account.access = 'rotated-access'
+    account.refresh = 'rotated-refresh'
+    account.expires = 2_000
+    await saveAccounts(staleStorage, accountPath)
+
+    const config = JSON.parse(await readFile(accountPath, 'utf8'))
+    const state = JSON.parse(
+      await readFile(getAccountStatePath(accountPath), 'utf8'),
+    )
+    expect(config.claustrum.mode).toBe('claustrum')
+    expect(state.claustrum?.mode).toBeUndefined()
+  })
+
+  test('serializes a mode write with another config write without losing either field', async () => {
+    const originalLevel = getLogLevel()
+    try {
+      await saveAccounts(baseStorage(), accountPath)
+
+      await Promise.all([
+        setClaustrumModePersistent('claustrum', accountPath),
+        setLogLevelPersistent('debug', accountPath),
+      ])
+
+      const config = JSON.parse(await readFile(accountPath, 'utf8'))
+      expect(config.claustrum.mode).toBe('claustrum')
+      expect(config.logging.level).toBe('debug')
+    } finally {
+      setLogLevel(originalLevel)
+    }
+  })
+
+  test('owns only enabled OAuth accounts with a resolved manifest binding in Claustrum mode', () => {
+    const binding = {
+      status: 'resolved' as const,
+      source: 'manifest' as const,
+      handle: 'manifest-handle',
+      credentialId: 'anthropic:work-alt',
+    }
+
+    for (const mode of ['local', 'claustrum'] as const) {
+      for (const enabled of [false, true]) {
+        for (const kind of ['oauth', 'api'] as const) {
+          for (const resolved of [false, true]) {
+            const account: AccountStorage['accounts'][number] =
+              kind === 'oauth'
+                ? {
+                    id: 'work-alt',
+                    type: 'oauth',
+                    refresh: 'refresh-token',
+                    enabled,
+                  }
+                : {
+                    id: 'work-alt',
+                    type: 'api',
+                    apiKey: 'api-key',
+                    baseURL: 'https://api.example.test',
+                    enabled,
+                  }
+            const storage: AccountStorage = {
+              ...baseStorage(),
+              claustrum: { mode },
+              accounts: [account],
+            }
+
+            expect(
+              isOAuthAccountVaultOwned(
+                storage,
+                account,
+                resolved ? binding : undefined,
+              ),
+            ).toBe(
+              mode === 'claustrum' && enabled && kind === 'oauth' && resolved,
+            )
+          }
+        }
+      }
+    }
+
+    const ownershipStorage = {
+      ...baseStorage(),
+      claustrum: { mode: 'claustrum' as const },
+    }
+    const ownershipAccount = {
+      id: 'work-alt',
+      type: 'oauth' as const,
+      refresh: 'refresh-token',
+      enabled: true,
+    }
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, binding),
+    ).toBe(true)
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, {
+        status: 'resolved',
+        source: 'legacy',
+        handle: 'legacy-handle',
+      }),
+    ).toBe(true)
+    expect(
+      isOAuthAccountVaultOwned(ownershipStorage, ownershipAccount, {
+        status: 'unresolved',
+        reason: 'missing-entry',
+      }),
+    ).toBe(false)
+    expect(
+      isOAuthAccountVaultOwned(
+        {
+          ...ownershipStorage,
+          claustrum: {
+            mode: 'claustrum',
+            accounts: { 'work-alt': { enabled: true } },
+          },
+        },
+        ownershipAccount,
+        undefined,
+      ),
+    ).toBe(false)
+    expect(
+      isOAuthAccountVaultOwned(
+        {
+          ...ownershipStorage,
+          claustrum: {
+            mode: 'local',
+            accounts: { 'work-alt': { enabled: true } },
+          },
+        },
+        ownershipAccount,
+        binding,
+      ),
+    ).toBe(false)
+  })
+})
+
+describe('clearClaustrumHandlePersistent', () => {
+  test('clears a handle from a whitespace-padded runtime state key', async () => {
+    const accountId = 'work-alt'
+    const handle = 'padded-state-handle'
+    await saveAccounts(baseStorage(), accountPath)
+    await addAccountPersistent(
+      {
+        id: accountId,
+        type: 'oauth',
+        refresh: 'refresh',
+        claustrumHandle: handle,
+      },
+      accountPath,
+    )
+    const statePath = getAccountStatePath(accountPath)
+    const state = JSON.parse(await readFile(statePath, 'utf8'))
+    state.accounts[' work-alt'] = state.accounts[accountId]
+    delete state.accounts[accountId]
+    await writeFile(statePath, JSON.stringify(state))
+
+    expect(
+      await clearClaustrumHandlePersistent({
+        id: accountId,
+        path: accountPath,
+      }),
+    ).toBe('updated')
+    expect(await readFile(statePath, 'utf8')).not.toContain(handle)
+  })
+
+  test('does not resurrect a cleared handle when a stale writer rotates tokens', async () => {
+    const accountId = 'custody-handle-fence'
+    const handle = 'custody-handle-fence-secret'
+    await saveAccounts(baseStorage(), accountPath)
+    await addAccountPersistent(
+      {
+        id: accountId,
+        type: 'oauth',
+        access: 'original-access',
+        refresh: 'original-refresh',
+        expires: 1_000,
+        claustrumHandle: handle,
+      },
+      accountPath,
+    )
+    const staleWriterStorage = (await loadAccounts(accountPath))!
+    const statePath = getAccountStatePath(accountPath)
+    expect(await readFile(statePath, 'utf8')).toContain(handle)
+
+    expect(
+      await clearClaustrumHandlePersistent({
+        id: accountId,
+        path: accountPath,
+      }),
+    ).toBe('updated')
+
+    const staleAccount = expectOAuthAccount(
+      staleWriterStorage.accounts.find((account) => account.id === accountId),
+    )
+    staleAccount.access = 'rotated-access'
+    staleAccount.refresh = 'rotated-refresh'
+    staleAccount.expires = 2_000
+    await saveAccountState(staleWriterStorage, accountPath, { accounts: true })
+
+    const stateBytes = await readFile(statePath, 'utf8')
+    expect(stateBytes).not.toContain(handle)
+    expect(JSON.parse(stateBytes).accounts?.[accountId]).toMatchObject({
+      access: 'rotated-access',
+      refresh: 'rotated-refresh',
+      expires: 2_000,
+    })
   })
 })
 
@@ -7451,7 +7990,7 @@ describe('vault-served fallback refresh gating', () => {
     expect(vault.lastRefreshError).toBeUndefined()
   })
 
-  test('a vault-enabled account whose vault is unavailable still refreshes locally', async () => {
+  test('a vault-owned account whose vault is unavailable does not refresh locally', async () => {
     const storage = baseStorage()
     storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
     storage.claustrum = {
@@ -7469,10 +8008,11 @@ describe('vault-served fallback refresh gating', () => {
       ),
       dueAccount(
         'vault-unavailable',
-        'outage-refresh',
+        'vault-unavailable-refresh',
         undefined,
         'handle-vault-unavailable',
       ),
+      dueAccount('plain-control', 'outage-refresh'),
     )
     await saveAccounts(storage, accountPath)
 
@@ -7489,10 +8029,8 @@ describe('vault-served fallback refresh gating', () => {
             JSON.parse(String(init?.body)) as { refresh_token: string }
           ).refresh_token
           refreshTokens.push(refreshToken)
-          if (refreshToken === 'vault-refresh') {
-            return new Response('{"error":"invalid_grant"}', { status: 400 })
-          }
-          return refreshResponse('vault-unavailable')
+          expect(refreshToken).toBe('outage-refresh')
+          return refreshResponse('plain-control')
         },
       ) as unknown as typeof fetch
 
@@ -7515,19 +8053,18 @@ describe('vault-served fallback refresh gating', () => {
       const unavailable = expectOAuthAccount(
         saved?.accounts.find((account) => account.id === 'vault-unavailable'),
       )
+      const plain = expectOAuthAccount(
+        saved?.accounts.find((account) => account.id === 'plain-control'),
+      )
       expect(refreshTokens).toEqual(['outage-refresh'])
       expect(served.access).toBe('vault-served-access')
       expect(served.lastRefreshError).toBeUndefined()
-      expect(unavailable.access).toBe('vault-unavailable-refreshed-access')
-      expect(logs).toContainEqual(
+      expect(unavailable.access).toBe('vault-unavailable-access')
+      expect(plain.access).toBe('plain-control-refreshed-access')
+      expect(logs).not.toContainEqual(
         expect.objectContaining({
-          level: 'warn',
-          channel: 'refresh',
-          message: 'custody override: local fallback refresh',
-          payload: {
-            accountId: 'vault-unavailable',
-            reason: 'vault credential unavailable',
-          },
+          message: 'vault service: local fallback refresh',
+          payload: expect.objectContaining({ accountId: 'vault-unavailable' }),
         }),
       )
     } finally {
