@@ -19454,7 +19454,7 @@ describe('claude-prime direct request', () => {
     )
 
     const intervalHandlers: Array<() => void> = []
-    globalThis.setInterval = mock((handler: () => void) => {
+    const setIntervalMock = mock((handler: () => void) => {
       intervalHandlers.push(handler)
       return { unref() {} }
     }) as unknown as typeof setInterval
@@ -19526,7 +19526,9 @@ describe('claude-prime direct request', () => {
       return Promise.resolve(new Response('not-mocked', { status: 599 }))
     }) as unknown as typeof fetch
 
-    const plugin = await getPlugin(mockClient)
+    const plugin = await getPlugin(mockClient, undefined, {
+      setInterval: setIntervalMock,
+    })
     await plugin.auth.loader(() => Promise.resolve(hostAuth), { models: {} })
     const manager = (plugin as any).__primeManager
     await manager.tick()
