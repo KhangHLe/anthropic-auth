@@ -116,10 +116,12 @@ anthropic-auth/
 - `packages/core/src/logger.ts`: Shared structured logger
 - `packages/core/src/json.ts`: Shared JSON parsing helpers that redact parser source context while preserving path, line, and column diagnostics
 - `packages/core/src/network-errors.ts`: Shared transient DNS and transport error classification for OAuth refresh and quota recovery
+- `packages/core/src/custom-headers.ts`: Bounded, redacted parsing for API-key/proxy-only custom headers with protected authentication, protocol, framing, and internal-correlation names
+- `packages/core/src/model-remap.ts`: Proxy-only generic and family-specific model alias resolution with strict family boundaries
 - `packages/core/src/pkce.ts`: PKCE challenge generation helper
 - `packages/core/src/quotas.ts`: Quota calculation and formatting helpers
 - `packages/core/src/constants.ts`: Global application constants
-- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping, Fable/Mythos 5.1 adaptive-thinking normalization, conditional Fable 5.1 binding controls, Claude Code 2.1.258 billing suffix pinning, and cache diagnostics opt-in), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
+- `packages/opencode/src/transform.ts`: Request rewriting (including trailing whitespace tool prefill stripping, Fable/Mythos 5.1 adaptive-thinking normalization, conditional Fable 5.1 binding controls, Claude Code 2.1.258 billing suffix pinning, cache diagnostics opt-in, API-route model aliases, and version-aware proxy base-path composition), system sanitization, cache strategy and model-specific cache bridges, server-side fallback request/response integration, completed-tool refusal continuation, tool prefix, SSE stripping
 - `packages/opencode/src/cache-diagnostics.ts`: Cache diagnosis beta request opt-in (`diagnostics.previous_message_id`), session message ID tracking, schema v:2 record construction with TTL token breakdown, and beta header hash deduplication
 - `packages/opencode/src/server-fallback.ts`: Default Anthropic server-side safety fallback opt-in for OAuth Fable 5/5.1 and Opus 5, hidden signed storage markers for unsupported `fallback` blocks, outgoing marker restoration, streamed handoff/sticky/restoration classification, and terminal-refusal rewriting after completed tool calls
 - `packages/opencode/src/fable-fallback.ts`: Per-session and source-model-family 10-response Opus 4.8 backstop state, source-model prewarming, and standby cache-anchor identity; used after unabsorbed server-policy refusals or exclusively under `OPENCODE_ANTHROPIC_AUTH_FALLBACK_MODE=legacy`

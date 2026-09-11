@@ -10190,6 +10190,53 @@ describe('auth.loader', () => {
     expect(result).toEqual({})
   })
 
+  test('remaps a non-OAuth Request body supplied without init.body', async () => {
+    const previousModel = process.env.ANTHROPIC_MODEL
+    process.env.ANTHROPIC_MODEL = 'proxy-model-alias'
+    let auth: {
+      type: string
+      access?: string
+      refresh?: string
+      expires?: number
+    } = {
+      type: 'oauth',
+      access: 'initial-oauth',
+      refresh: 'initial-refresh',
+      expires: Date.now() + 100_000,
+    }
+    let observedBody: Record<string, unknown> | undefined
+    globalThis.fetch = mock(async (_input: unknown, init?: RequestInit) => {
+      observedBody = JSON.parse(String(init?.body))
+      return new Response('{}', { status: 200 })
+    }) as unknown as typeof fetch
+
+    try {
+      const plugin = await getPlugin()
+      const result = await plugin.auth.loader(
+        () => Promise.resolve(auth as never),
+        {
+          models: {},
+        },
+      )
+      auth = { type: 'api' }
+      await result.fetch(
+        new Request(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            model: 'claude-custom-family',
+            messages: [{ role: 'user', content: 'hello' }],
+          }),
+        }),
+      )
+
+      expect(observedBody?.model).toBe('proxy-model-alias')
+    } finally {
+      if (previousModel === undefined) delete process.env.ANTHROPIC_MODEL
+      else process.env.ANTHROPIC_MODEL = previousModel
+    }
+  })
+
   test('returns fetch wrapper for oauth auth', async () => {
     const plugin = await getPlugin()
     const result = await plugin.auth.loader(

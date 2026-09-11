@@ -4,6 +4,10 @@ This package is a CortexKit-maintained fork of the original `@ex-machina/opencod
 
 ## Unreleased
 
+### Minor Changes
+
+- Add API-key/proxy-only custom headers and model aliases while preserving versioned proxy base paths and protecting route authentication, protocol headers, body framing, and internal correlation state.
+
 ### Patch Changes
 
 - Harden global Claustrum takeover as a resumable fail-closed transition: repeated commands accept already tombstoned fallbacks, failed partial commits never restore whole-file snapshots over concurrent account edits, local fallback login is refused before OAuth while custody is active, and main-account Prime uses the resident vault credential for quota checks and sends with version-fenced 401 reporting.

@@ -666,7 +666,7 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | Variable | Description |
 | --- | --- |
 | `ANTHROPIC_BASE_URL` | Override the Anthropic API endpoint. Must be HTTP(S). |
-| `ANTHROPIC_CUSTOM_HEADERS` | Add or override headers on API-key and proxy routes. Ignored for OAuth requests. |
+| `ANTHROPIC_CUSTOM_HEADERS` | Add proxy-specific headers on API-key and proxy routes. Authentication, protocol, framing, and internal correlation headers cannot be overridden. Ignored for OAuth requests. |
 | `ANTHROPIC_MODEL` | Default proxy alias for any `claude-*` model. Ignored for OAuth requests. |
 | `ANTHROPIC_DEFAULT_SONNET_MODEL` | Proxy alias for `claude-sonnet-*` models. |
 | `ANTHROPIC_DEFAULT_OPUS_MODEL` | Proxy alias for `claude-opus-*` models. |
@@ -680,9 +680,9 @@ Dump state is persisted in the active sidecar config as `dump.enabled` (`~/.conf
 | `CLOUDFLARE_API_TOKEN` | Cloudflare token used by `bunx @cortexkit/opencode-anthropic-auth relay setup`. Not stored. |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID used by relay setup. |
 
-`ANTHROPIC_CUSTOM_HEADERS` and the model-alias variables apply only to API-key and proxy routes. OAuth requests keep the Claude Code header and model identity unchanged. Custom headers accept either a JSON object or comma/newline-separated `name: value` entries. Invalid values are ignored with one warning.
+`ANTHROPIC_CUSTOM_HEADERS` and the model-alias variables apply only to API-key and proxy routes. OAuth requests keep the Claude Code header and model identity unchanged. Custom headers accept either a JSON object or comma/newline-separated `name: value` entries. A configuration containing an invalid or protected header is ignored as a whole with one redacted warning; it cannot replace route authentication, Anthropic protocol headers, body framing, or plugin-internal correlation headers.
 
-An `ANTHROPIC_BASE_URL` path is preserved. For example, `https://proxy.example/anthropic` sends requests to `/anthropic/v1/messages`. The `/v1` path repair applies only while a base-URL override is active.
+An `ANTHROPIC_BASE_URL` path is preserved. For example, `https://proxy.example/anthropic` sends requests to `/anthropic/v1/messages`, while a versioned base such as `https://proxy.example/anthropic/v2` sends to `/anthropic/v2/messages`. Existing version segments are not duplicated, and unrelated paths ending in `/messages` are not rewritten.
 
 ## Request rewriting
 

@@ -194,6 +194,24 @@ describe('Pi API fallback routing helpers', () => {
     )
   })
 
+  test('does not duplicate a trailing version segment in provider base paths', () => {
+    expect(
+      buildExplicitBaseMessagesUrl(
+        'https://proxy.example.test/anthropic/v1',
+      ).toString(),
+    ).toBe('https://proxy.example.test/anthropic/v1/messages?beta=true')
+    expect(
+      buildExplicitBaseMessagesUrl(
+        'https://proxy.example.test/anthropic/v2',
+      ).toString(),
+    ).toBe('https://proxy.example.test/anthropic/v2/messages?beta=true')
+    expect(
+      buildExplicitBaseMessagesUrl(
+        'https://proxy.example.test/anthropic/v1/messages',
+      ).toString(),
+    ).toBe('https://proxy.example.test/anthropic/v1/messages?beta=true')
+  })
+
   test('uses bearer auth by default for API fallback routes', () => {
     const headers = configureApiRouteHeaders(
       {
@@ -423,11 +441,10 @@ describe('Pi API fallback routing helpers', () => {
     expect(events.some((event) => event.type === 'error')).toBe(true)
   })
 
-  test('applies ANTHROPIC_CUSTOM_HEADERS to API fallback routes', () => {
+  test('applies safe ANTHROPIC_CUSTOM_HEADERS to API fallback routes', () => {
     const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
     process.env.ANTHROPIC_CUSTOM_HEADERS = JSON.stringify({
       'x-provider-api-key': 'provider-key',
-      'anthropic-version': '2024-01-01',
     })
     try {
       const headers = configureApiRouteHeaders(
@@ -442,7 +459,38 @@ describe('Pi API fallback routing helpers', () => {
       )
 
       expect(headers.get('x-provider-api-key')).toBe('provider-key')
-      expect(headers.get('anthropic-version')).toBe('2024-01-01')
+      expect(headers.get('anthropic-version')).toBe('2023-06-01')
+    } finally {
+      if (previous === undefined) {
+        delete process.env.ANTHROPIC_CUSTOM_HEADERS
+      } else {
+        process.env.ANTHROPIC_CUSTOM_HEADERS = previous
+      }
+    }
+  })
+
+  test('does not let custom headers replace API route authentication or protocol headers', () => {
+    const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
+    process.env.ANTHROPIC_CUSTOM_HEADERS = JSON.stringify({
+      authorization: 'Bearer overridden',
+      'anthropic-beta': 'overridden-beta',
+      'x-safe-header': 'must-not-partially-apply',
+    })
+    try {
+      const headers = configureApiRouteHeaders(
+        {
+          id: 'provider-route',
+          type: 'api',
+          apiKey: 'provider-key',
+          baseURL: 'https://provider.example/anthropic',
+          authHeader: 'authorization-bearer',
+        },
+        true,
+      )
+
+      expect(headers.get('authorization')).toBe('Bearer provider-key')
+      expect(headers.get('anthropic-beta')).toContain('fast-mode-2026-02-01')
+      expect(headers.get('x-safe-header')).toBeNull()
     } finally {
       if (previous === undefined) {
         delete process.env.ANTHROPIC_CUSTOM_HEADERS

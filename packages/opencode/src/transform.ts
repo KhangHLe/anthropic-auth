@@ -346,26 +346,30 @@ export function rewriteUrl(
     : resolveBaseUrl()
   if (baseUrl) {
     const basePath = baseUrl.pathname.replace(/\/$/, '')
+    const inputPath = requestUrl.pathname
     requestUrl.protocol = baseUrl.protocol
     requestUrl.host = baseUrl.host
-    if (
-      basePath &&
-      requestUrl.pathname !== basePath &&
-      !requestUrl.pathname.startsWith(`${basePath}/`)
-    ) {
-      requestUrl.pathname = `${basePath}${requestUrl.pathname}`
-    }
 
-    // The SDK sends {baseURL}/messages, so proxy overrides need the missing
-    // version segment restored without rewriting an unconfigured endpoint.
-    if (
-      requestUrl.pathname.endsWith('/messages') &&
-      !requestUrl.pathname.endsWith('/v1/messages')
-    ) {
-      requestUrl.pathname = requestUrl.pathname.replace(
-        /\/messages$/,
-        '/v1/messages',
-      )
+    const alreadyUnderBase =
+      inputPath === basePath ||
+      (basePath !== '' && inputPath.startsWith(`${basePath}/`))
+    if (!alreadyUnderBase) {
+      const baseEndsInVersion = /\/v\d[^/]*$/.test(basePath)
+      if (inputPath === '/messages') {
+        requestUrl.pathname = baseEndsInVersion
+          ? `${basePath}/messages`
+          : `${basePath}/v1/messages`
+      } else if (inputPath === '/v1/messages' && baseEndsInVersion) {
+        requestUrl.pathname = `${basePath}/messages`
+      } else {
+        requestUrl.pathname = `${basePath}${inputPath}`
+      }
+    } else if (inputPath === `${basePath}/messages`) {
+      // Repair only the exact SDK form under a non-versioned base. Do not
+      // rewrite sibling resources or explicit /v2 (and later) proxy paths.
+      if (!/\/v\d[^/]*$/.test(basePath)) {
+        requestUrl.pathname = `${basePath}/v1/messages`
+      }
     }
   }
 

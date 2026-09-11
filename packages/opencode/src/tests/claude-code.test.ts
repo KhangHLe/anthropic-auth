@@ -313,7 +313,7 @@ describe('Claude Code fingerprint helpers', () => {
     const previous = process.env.ANTHROPIC_CUSTOM_HEADERS
     const identity: ClaudeCodeIdentity = {
       deviceId: 'a'.repeat(64),
-      accountUuid: '11111111-2222-4333-8444-555555555555',
+      accountUuid: providerUuid('11111111-2222-4333-8444-555555555555'),
       sessionId: '66666666-7777-4888-9999-aaaaaaaaaaaa',
     }
     const body = {

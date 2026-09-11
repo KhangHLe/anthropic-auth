@@ -24,11 +24,10 @@ function getEnv(name: string): string | undefined {
 type ModelTier = 'sonnet' | 'opus' | 'haiku' | 'fable'
 
 function getModelTier(model: string): ModelTier | null {
-  if (model.startsWith('claude-sonnet')) return 'sonnet'
-  if (model.startsWith('claude-opus')) return 'opus'
-  if (model.startsWith('claude-haiku')) return 'haiku'
-  if (model.startsWith('claude-fable') || model.startsWith('claude-mythos'))
-    return 'fable'
+  if (/^claude-sonnet(?:-|$)/.test(model)) return 'sonnet'
+  if (/^claude-opus(?:-|$)/.test(model)) return 'opus'
+  if (/^claude-haiku(?:-|$)/.test(model)) return 'haiku'
+  if (/^claude-(?:fable|mythos)(?:-|$)/.test(model)) return 'fable'
   return null
 }
 

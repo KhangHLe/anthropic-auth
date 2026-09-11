@@ -512,6 +512,19 @@ function fetchMethod(
   return init?.method ?? (input instanceof Request ? input.method : undefined)
 }
 
+async function fetchBody(
+  input: string | URL | Request,
+  init: RequestInit | undefined,
+): Promise<RequestInit['body']> {
+  if (init?.body !== undefined) return init.body
+  if (!(input instanceof Request) || input.body === null) return undefined
+  try {
+    return await input.clone().text()
+  } catch {
+    return undefined
+  }
+}
+
 function errorText(error: unknown) {
   return error instanceof Error ? error.message : String(error)
 }
@@ -6056,7 +6069,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
-            let body = init?.body
+            let body = await fetchBody(input, init)
             let streaming = false
             let dump: DumpHandle | null = null
 
@@ -7466,7 +7479,7 @@ const anthropicAuthPlugin = async (
                 const rewritten = rewriteUrl(input)
                 const passthroughHeaders = mergeHeaders(input, init)
                 applyCustomHeaders(passthroughHeaders)
-                let passthroughBody = init?.body
+                let passthroughBody = await fetchBody(input, init)
                 if (typeof passthroughBody === 'string') {
                   try {
                     const parsed = JSON.parse(passthroughBody)

@@ -950,6 +950,32 @@ describe('rewriteUrl', () => {
     expect(url.searchParams.get('beta')).toBe('true')
   })
 
+  test('does not duplicate a trailing /v1 in a nested proxy base path', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic/v1'
+    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
+    const url = new URL(input.toString())
+    expect(url.pathname).toBe('/anthropic/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
+  test('keeps an explicit v2 proxy endpoint instead of injecting v1', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic/v2'
+    const { input } = rewriteUrl('https://api.anthropic.com/messages')
+    const url = new URL(input.toString())
+    expect(url.pathname).toBe('/anthropic/v2/messages')
+    expect(url.searchParams.has('beta')).toBe(false)
+  })
+
+  test('does not rewrite a sibling messages resource under the base path', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
+    const { input } = rewriteUrl(
+      'https://proxy.example.test/anthropic/admin/messages',
+    )
+    const url = new URL(input.toString())
+    expect(url.pathname).toBe('/anthropic/admin/messages')
+    expect(url.searchParams.has('beta')).toBe(false)
+  })
+
   test('does not duplicate ANTHROPIC_BASE_URL path already present in request', () => {
     process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
     const { input } = rewriteUrl(
