@@ -738,7 +738,7 @@ describe('QuotaManager', () => {
   })
 
   describe('persistence', () => {
-    test('seeds main quota from persisted storage', () => {
+    test('seeds legacy main quota without trusting its unbound timestamp', () => {
       const quota = {
         quotas: [],
         expires: new Date(2_000_000).toISOString(),
@@ -757,7 +757,7 @@ describe('QuotaManager', () => {
 
       const main = qm.getMain()
       expect(main).not.toBeNull()
-      expect(main!.checkedAt).toBe(900_000)
+      expect(main!.checkedAt).toBe(0)
     })
 
     test('getMain(mainAccountId) rejects a cached entry from a different identity', () => {

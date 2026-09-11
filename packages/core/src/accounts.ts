@@ -2059,14 +2059,11 @@ function applyMainQuotaStatePatch(
   const mergesHeaderQuota = Boolean(
     sameToken && incomingQuota?.source === 'headers',
   )
-  const existingCheckedAt =
-    typeof state.main.quotaCheckedAt === 'number'
-      ? state.main.quotaCheckedAt
-      : quotaSnapshotCheckedAt(state.main.quota)
-  const incomingCheckedAt =
-    typeof storage.quota?.mainQuotaCheckedAt === 'number'
-      ? storage.quota.mainQuotaCheckedAt
-      : quotaSnapshotCheckedAt(effectiveIncomingQuota)
+  // Ordering authority must travel inside the account-bound snapshot. The
+  // legacy top-level quotaCheckedAt/mainQuotaCheckedAt fields carry no account
+  // identity and can form a mixed pair under concurrent cross-account writes.
+  const existingCheckedAt = quotaSnapshotCheckedAt(state.main.quota)
+  const incomingCheckedAt = quotaSnapshotCheckedAt(effectiveIncomingQuota)
   if (
     !mergesHeaderQuota &&
     (existingCheckedAt > incomingCheckedAt ||
@@ -2078,9 +2075,8 @@ function applyMainQuotaStatePatch(
   }
 
   state.main.quota = effectiveIncomingQuota
-  state.main.quotaCheckedAt = mergesHeaderQuota
-    ? Math.max(existingCheckedAt, incomingCheckedAt)
-    : storage.quota?.mainQuotaCheckedAt
+  const boundCheckedAt = quotaSnapshotCheckedAt(effectiveIncomingQuota)
+  state.main.quotaCheckedAt = boundCheckedAt > 0 ? boundCheckedAt : undefined
   state.main.quotaToken = storage.quota?.mainQuotaToken
 }
 
@@ -3298,13 +3294,13 @@ export function getPersistedMainQuota(storage: AccountStorage | null): {
   tokenFingerprint?: string
   accountIdentity?: string
 } | null {
-  if (!storage?.quota?.mainQuota || !storage.quota.mainQuotaCheckedAt)
-    return null
+  const quota = storage?.quota?.mainQuota
+  if (!quota) return null
   return {
-    quota: storage.quota.mainQuota,
-    checkedAt: storage.quota.mainQuotaCheckedAt,
-    tokenFingerprint: storage.quota.mainQuotaToken,
-    accountIdentity: storage.quota.mainQuota.accountIdentity,
+    quota,
+    checkedAt: quotaSnapshotCheckedAt(quota),
+    tokenFingerprint: storage.quota?.mainQuotaToken,
+    accountIdentity: quota.accountIdentity,
   }
 }
 

@@ -10,6 +10,7 @@ import {
   hasNoLocalCredential,
   loadAccounts,
   type OAuthAccount,
+  saveAccountState,
   saveAccounts,
 } from '../accounts.ts'
 
@@ -206,5 +207,56 @@ test('keeps tombstone metadata when discarding a stale credential write', async 
         quota: storedQuota,
       },
     ],
+  })
+})
+
+test('main quota persistence ignores an unbound future observation timestamp', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'accounts-persistence-'))
+  directories.push(directory)
+  const path = join(directory, 'anthropic-auth.json')
+  await saveAccounts(
+    {
+      version: 1,
+      accounts: [],
+      mainAccountId: 'account-a',
+      quota: {
+        mainQuota: {
+          accountIdentity: 'account-a',
+          checkedAt: 200,
+          five_hour: {
+            usedPercent: 20,
+            remainingPercent: 80,
+            checkedAt: 200,
+          },
+        },
+        mainQuotaCheckedAt: 200,
+        mainQuotaToken: 'lineage-a',
+      },
+    },
+    path,
+  )
+
+  const stale = await loadAccounts(path)
+  if (!stale?.quota) throw new Error('missing quota fixture')
+  stale.quota.mainQuota = {
+    accountIdentity: 'account-a',
+    checkedAt: 100,
+    five_hour: {
+      usedPercent: 80,
+      remainingPercent: 20,
+      checkedAt: 100,
+    },
+  }
+  stale.quota.mainQuotaCheckedAt = 999
+  await saveAccountState(stale, path, { mainQuota: true })
+
+  await expect(loadAccounts(path)).resolves.toMatchObject({
+    quota: {
+      mainQuota: {
+        checkedAt: 200,
+        five_hour: { usedPercent: 20 },
+      },
+      mainQuotaCheckedAt: 200,
+    },
   })
 })
