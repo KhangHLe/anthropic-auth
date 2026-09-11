@@ -907,12 +907,58 @@ describe('rewriteUrl', () => {
     expect(url.searchParams.has('beta')).toBe(false)
   })
 
+  test('preserves a root /messages path without a base URL override', () => {
+    const { input } = rewriteUrl('https://api.anthropic.com/messages')
+    const url = new URL(input.toString())
+    expect(url.pathname).toBe('/messages')
+    expect(url.searchParams.has('beta')).toBe(false)
+  })
+
+  test('normalizes a root /messages path under ANTHROPIC_BASE_URL', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
+    const { input } = rewriteUrl('https://api.anthropic.com/messages')
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://proxy.example.test')
+    expect(url.pathname).toBe('/anthropic/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
+  test('normalizes a root /messages path under a per-account base URL', () => {
+    const { input } = rewriteUrl('https://api.anthropic.com/messages', {
+      baseURL: 'https://api.kie.ai/claude',
+    })
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://api.kie.ai')
+    expect(url.pathname).toBe('/claude/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
   test('overrides origin when ANTHROPIC_BASE_URL is set', () => {
     process.env.ANTHROPIC_BASE_URL = 'http://localhost:8080'
     const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
     const url = new URL(input.toString())
     expect(url.origin).toBe('http://localhost:8080')
     expect(url.pathname).toBe('/v1/messages')
+  })
+
+  test('applies ANTHROPIC_BASE_URL path before /v1/messages', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
+    const { input } = rewriteUrl('https://api.anthropic.com/v1/messages')
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://proxy.example.test')
+    expect(url.pathname).toBe('/anthropic/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
+  })
+
+  test('does not duplicate ANTHROPIC_BASE_URL path already present in request', () => {
+    process.env.ANTHROPIC_BASE_URL = 'https://proxy.example.test/anthropic'
+    const { input } = rewriteUrl(
+      'https://proxy.example.test/anthropic/v1/messages',
+    )
+    const url = new URL(input.toString())
+    expect(url.origin).toBe('https://proxy.example.test')
+    expect(url.pathname).toBe('/anthropic/v1/messages')
+    expect(url.searchParams.get('beta')).toBe('true')
   })
 
   test('applies explicit fallback base URL path before /v1/messages', () => {
@@ -979,12 +1025,14 @@ describe('rewriteUrl', () => {
   })
 
   test('returns original input when no URL changes are needed', () => {
+    delete process.env.ANTHROPIC_BASE_URL
     const original = 'https://api.anthropic.com/v1/complete'
     const { input } = rewriteUrl(original)
     expect(input).toBe(original)
   })
 
   test('returns original Request when no URL changes are needed', () => {
+    delete process.env.ANTHROPIC_BASE_URL
     const request = new Request('https://api.anthropic.com/v1/complete')
     const { input } = rewriteUrl(request)
     expect(input).toBe(request)
@@ -3936,6 +3984,161 @@ describe('rewriteRequestBody', () => {
     )
     expect(cachedBlocks).toHaveLength(1)
     expect(cachedBlocks[0].type).toBe('text')
+  })
+
+  describe('model remapping via ANTHROPIC_DEFAULT_*_MODEL', () => {
+    const envBackup: Record<string, string | undefined> = {}
+
+    function setEnv(vars: Record<string, string | undefined>) {
+      for (const [key, value] of Object.entries(vars)) {
+        envBackup[key] = process.env[key]
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+
+    function restoreEnv() {
+      for (const [key, value] of Object.entries(envBackup)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+      for (const key of Object.keys(envBackup)) delete envBackup[key]
+    }
+
+    afterEach(() => restoreEnv())
+
+    test('keeps Fable OAuth requests on their original model and thinking shape', async () => {
+      setEnv({ ANTHROPIC_MODEL: 'claude-sonnet-4-6' })
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5-1',
+            thinking: { type: 'adaptive' },
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+        ),
+      )
+      const headers = new Headers()
+      setOAuthHeaders(headers, 'token', { body: result })
+
+      expect(result.model).toBe('claude-fable-5-1')
+      expect(result.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+      expect(headers.get('anthropic-beta')).toContain('oauth-2025-04-20')
+    })
+
+    test('remaps API-key Fable requests after source-model normalization', async () => {
+      setEnv({ ANTHROPIC_MODEL: 'claude-sonnet-4-6' })
+      const result = JSON.parse(
+        await rewriteRequestBody(
+          JSON.stringify({
+            model: 'claude-fable-5-1',
+            thinking: { type: 'adaptive' },
+            messages: [{ role: 'user', content: 'hi' }],
+          }),
+          { modelRemapEnabled: true },
+        ),
+      )
+
+      expect(result.model).toBe('claude-sonnet-4-6')
+      expect(result.thinking).toEqual({
+        type: 'adaptive',
+        display: 'summarized',
+      })
+    })
+
+    test('remaps sonnet model using ANTHROPIC_DEFAULT_SONNET_MODEL', async () => {
+      setEnv({ ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6' })
+      const body = JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
+      expect(result.model).toBe('claude-sonnet-4-6')
+    })
+
+    test('remaps opus model using ANTHROPIC_DEFAULT_OPUS_MODEL', async () => {
+      setEnv({ ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-8' })
+      const body = JSON.stringify({
+        model: 'claude-opus-4-20250514',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
+      expect(result.model).toBe('claude-opus-4-8')
+    })
+
+    test('remaps haiku model using ANTHROPIC_DEFAULT_HAIKU_MODEL', async () => {
+      setEnv({ ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001' })
+      const body = JSON.stringify({
+        model: 'claude-haiku-4-5',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
+      expect(result.model).toBe('claude-haiku-4-5-20251001')
+    })
+
+    test('remaps fable/mythos model using ANTHROPIC_DEFAULT_FABLE_MODEL', async () => {
+      setEnv({ ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5' })
+      const body = JSON.stringify({
+        model: 'claude-mythos-5',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
+      expect(result.model).toBe('claude-fable-5')
+    })
+
+    test('tier-specific var takes precedence over ANTHROPIC_MODEL', async () => {
+      setEnv({
+        ANTHROPIC_MODEL: 'claude-fallback',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
+      })
+      const body = JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
+      expect(result.model).toBe('claude-sonnet-4-6')
+    })
+
+    test('falls back to ANTHROPIC_MODEL for unmatched claude model', async () => {
+      setEnv({ ANTHROPIC_MODEL: 'claude-default-proxy' })
+      const body = JSON.stringify({
+        model: 'claude-unknown-99',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(
+        await rewriteRequestBody(body, { modelRemapEnabled: true }),
+      )
+      expect(result.model).toBe('claude-default-proxy')
+    })
+
+    test('leaves model unchanged when no env vars are set', async () => {
+      setEnv({
+        ANTHROPIC_MODEL: undefined,
+        ANTHROPIC_DEFAULT_SONNET_MODEL: undefined,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: undefined,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: undefined,
+        ANTHROPIC_DEFAULT_FABLE_MODEL: undefined,
+      })
+      const body = JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        messages: [{ role: 'user', content: 'hi' }],
+      })
+      const result = JSON.parse(await rewriteRequestBody(body))
+      expect(result.model).toBe('claude-sonnet-4-20250514')
+    })
   })
 })
 

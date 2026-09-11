@@ -5,6 +5,7 @@ import {
   type ApiKeyAccount,
   acquireRefreshFileLock,
   addAccountPersistent,
+  applyCustomHeaders,
   assertNotCustodyTombstone,
   authorize,
   buildAccountList,
@@ -165,6 +166,7 @@ import {
   quotaSnapshotPassesPolicy,
   refreshBackoffActive,
   refreshClaudeOAuthToken,
+  remapRequestBodyModel,
   removeAccountPersistent,
   reorderAccountsPersistent,
   resolveClaudeCodeIdentity,
@@ -6023,6 +6025,7 @@ const anthropicAuthPlugin = async (
               headers.set('Authorization', `Bearer ${account.apiKey ?? ''}`)
             }
             headers.set('Content-Type', 'application/json')
+            applyCustomHeaders(headers)
           }
 
           async function sendWithApiAccount(
@@ -6078,6 +6081,7 @@ const anthropicAuthPlugin = async (
                   midConversationEffortEnabled: false,
                   midConversationEffortPlan: effortPlanHeader,
                   midConversationEffortResolvedPlan: resolvedEffortPlan,
+                  modelRemapEnabled: true,
                   perf: (stage, data) =>
                     trace?.mark(`rewrite_body_${stage}`, { route, ...data }),
                 })
@@ -7459,7 +7463,23 @@ const anthropicAuthPlugin = async (
                 hasAccess: Boolean(auth.access),
               })
               if (auth.type !== 'oauth') {
-                const response = await fetch(input, init)
+                const rewritten = rewriteUrl(input)
+                const passthroughHeaders = mergeHeaders(input, init)
+                applyCustomHeaders(passthroughHeaders)
+                let passthroughBody = init?.body
+                if (typeof passthroughBody === 'string') {
+                  try {
+                    const parsed = JSON.parse(passthroughBody)
+                    if (remapRequestBodyModel(parsed)) {
+                      passthroughBody = JSON.stringify(parsed)
+                    }
+                  } catch {}
+                }
+                const response = await fetch(rewritten.input, {
+                  ...init,
+                  body: passthroughBody,
+                  headers: passthroughHeaders,
+                })
                 trace.done('non_oauth_passthrough', { status: response.status })
                 return response
               }

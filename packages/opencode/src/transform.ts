@@ -28,6 +28,7 @@ import {
   orderClaudeCodeBody,
   PARAGRAPH_REMOVAL_ANCHORS,
   REQUIRED_BETAS,
+  remapRequestBodyModel,
   selectClaudeCodeBetas,
   signRequestBody,
   TEXT_REPLACEMENTS,
@@ -344,10 +345,27 @@ export function rewriteUrl(
     ? parseBaseUrl(options.baseURL)
     : resolveBaseUrl()
   if (baseUrl) {
+    const basePath = baseUrl.pathname.replace(/\/$/, '')
     requestUrl.protocol = baseUrl.protocol
     requestUrl.host = baseUrl.host
-    if (options.baseURL) {
-      requestUrl.pathname = `${baseUrl.pathname.replace(/\/$/, '')}${requestUrl.pathname}`
+    if (
+      basePath &&
+      requestUrl.pathname !== basePath &&
+      !requestUrl.pathname.startsWith(`${basePath}/`)
+    ) {
+      requestUrl.pathname = `${basePath}${requestUrl.pathname}`
+    }
+
+    // The SDK sends {baseURL}/messages, so proxy overrides need the missing
+    // version segment restored without rewriting an unconfigured endpoint.
+    if (
+      requestUrl.pathname.endsWith('/messages') &&
+      !requestUrl.pathname.endsWith('/v1/messages')
+    ) {
+      requestUrl.pathname = requestUrl.pathname.replace(
+        /\/messages$/,
+        '/v1/messages',
+      )
     }
   }
 
@@ -1241,6 +1259,7 @@ export async function rewriteRequestBody(
     perf?: RewritePerfCallback
     hybridStandbyAnchor?: HybridMessageCacheAnchor
     serverSideFallbackEnabled?: boolean
+    modelRemapEnabled?: boolean
     laneStart?: boolean
     cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
@@ -1393,6 +1412,7 @@ export async function rewriteRequestBody(
     })
 
     const prefixStart = rewriteNowMs()
+    if (options.modelRemapEnabled === true) remapRequestBodyModel(parsed)
     const prefixed = prefixToolNames(parsed)
     options.perf?.('prefix_tools_stringify', {
       ms: rewriteRoundMs(rewriteNowMs() - prefixStart),
