@@ -11,6 +11,7 @@ This repo is a CortexKit-maintained Anthropic auth monorepo for OpenCode and Pi.
 
 ### Patch Changes
 
+- Harden global Claustrum takeover as a resumable fail-closed transition: repeated commands accept already tombstoned fallbacks, failed partial commits never restore whole-file snapshots over concurrent account edits, local fallback login is refused before OAuth while custody is active, and main-account Prime uses the resident vault credential for quota checks and sends with version-fenced 401 reporting.
 - Keep OpenCode's request-scoped Fable 5.1 effort plan available across automatic retries of the same transformed message, and fold effort changes removed by downstream prefix compaction into the retained baseline through a checksum-bound current-boundary anchor. This prevents transient retries and legitimate Magic Context trims from becoming local plan-correlation failures while preserving fail-closed validation for non-prefix loss.
 
 ## 1.22.0

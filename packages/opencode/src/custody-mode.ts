@@ -197,6 +197,16 @@ function oauthFingerprintMaterial(
   return { access, refresh }
 }
 
+function takeoverFingerprintMaterial(
+  value: unknown,
+  isMain: boolean,
+): { access: string; refresh: string } | undefined {
+  if (isMain || isCustodyTombstoneOAuth(value, 'anthropic')) {
+    return oauthFingerprintMaterial(value)
+  }
+  return localOAuthMaterial(value)
+}
+
 function enabledOAuthRoutes(
   input: PreflightClaustrumTakeoverInput,
   mainAuth: unknown,
@@ -316,10 +326,10 @@ export async function preflightClaustrumTakeover(
       refuse(route, 'divergence_fenced')
       continue
     }
-    const local =
-      route.id === input.main.id
-        ? oauthFingerprintMaterial(route.local)
-        : localOAuthMaterial(route.local)
+    const local = takeoverFingerprintMaterial(
+      route.local,
+      route.id === input.main.id,
+    )
     if (!local) {
       refuse(
         route,
@@ -531,37 +541,16 @@ export class CustodyTransitionError extends Error {
   }
 }
 
-export class CustodyTransitionRollbackError extends Error {
-  readonly code = 'custody_transition_rollback_failed'
-
-  constructor() {
-    super('custody transition rollback failed')
-  }
-
-  toJSON() {
-    return { code: this.code }
-  }
-}
-
-export type CustodySidecarSnapshot = {
-  config: Uint8Array | null
-  state: Uint8Array | null
-  manifest?: Uint8Array | null
-}
-
 export type ExecuteClaustrumTakeoverDeps = {
   locks: Parameters<typeof acquireCustodyTransitionLocks>[0]
   getLocalAuth: (accountId: string) => Promise<unknown>
   isCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
-  snapshotSidecars: () => Promise<CustodySidecarSnapshot>
   writeManifestBindings: (plan: ClaustrumTakeoverPlan) => Promise<void>
   writeSidecarAccount: (
     account: ClaustrumTakeoverPlan['accounts'][number],
   ) => Promise<void>
   verifyTarget: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
   verifyCommitted: (plan: ClaustrumTakeoverPlan) => Promise<boolean>
-  restoreSidecars: (snapshot: CustodySidecarSnapshot) => Promise<void>
-  verifyRollback: (snapshot: CustodySidecarSnapshot) => Promise<boolean>
   setMode: (mode: 'claustrum' | 'local') => Promise<'changed' | 'unchanged'>
 }
 
@@ -575,10 +564,7 @@ export async function executeClaustrumTakeover(
 
     for (const account of plan.accounts) {
       const current = await deps.getLocalAuth(account.id)
-      const local =
-        account.id === 'main'
-          ? oauthFingerprintMaterial(current)
-          : localOAuthMaterial(current)
+      const local = takeoverFingerprintMaterial(current, account.id === 'main')
       if (
         !local ||
         localAuthFingerprint(local.access, local.refresh) !==
@@ -588,9 +574,8 @@ export async function executeClaustrumTakeover(
       }
     }
 
-    const snapshot = await deps.snapshotSidecars()
     let accountId: string | undefined
-    let modeCommitted = false
+    let modeChanged = false
     try {
       try {
         await deps.writeManifestBindings(plan)
@@ -602,21 +587,32 @@ export async function executeClaustrumTakeover(
         accountId = account.id
         await deps.writeSidecarAccount(account)
       }
-      if (!(await deps.verifyTarget(plan))) {
+      let targetVerified = false
+      try {
+        targetVerified = await deps.verifyTarget(plan)
+      } catch {}
+      if (!targetVerified) {
         throw new CustodyTransitionError('readback', accountId)
       }
       try {
-        await deps.setMode('claustrum')
-        modeCommitted = true
+        modeChanged = (await deps.setMode('claustrum')) === 'changed'
       } catch {
         throw new CustodyTransitionError('mode_commit')
       }
-      if (!(await deps.verifyCommitted(plan))) {
+      let committed = false
+      try {
+        committed = await deps.verifyCommitted(plan)
+      } catch {}
+      if (!committed) {
         throw new CustodyTransitionError('post_commit_readback')
       }
       return 'changed'
     } catch (error) {
-      if (modeCommitted) {
+      // Every intermediate write is fail-closed and can be resumed. Restoring
+      // whole-file snapshots here could erase a concurrent login or account
+      // edit, so a failed transition deliberately leaves completed steps in
+      // place and keeps (or restores) local mode.
+      if (modeChanged) {
         try {
           await deps.setMode('local')
         } catch {
@@ -626,16 +622,6 @@ export async function executeClaustrumTakeover(
             'mode is claustrum and unverified — run `/claude-account local`',
           )
         }
-      }
-      try {
-        await deps.restoreSidecars(snapshot)
-        if (!(await deps.verifyRollback(snapshot))) {
-          throw new CustodyTransitionRollbackError()
-        }
-      } catch (rollbackError) {
-        if (rollbackError instanceof CustodyTransitionRollbackError)
-          throw rollbackError
-        throw new CustodyTransitionRollbackError()
       }
       if (error instanceof CustodyTransitionError) throw error
       throw new CustodyTransitionError('write_sidecar', accountId)

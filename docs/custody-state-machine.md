@@ -226,39 +226,39 @@ refresh inert and the account stays dark until a real login clears it.
 
 ## 7. The takeover barrier (`/claude-account claustrum`)
 
-An **all-accounts readiness barrier**, not an atomic commit: the writes span `auth.json`, the sidecar,
-and the manifest, and cannot be made kill-atomic. The barrier makes every crash-visible intermediate
-a state with a named verdict (§5) and a resume path.
+An **all-accounts readiness barrier**, not an atomic commit: the writes span the sidecar and shared
+manifest and cannot be made kill-atomic. Every completed intermediate write is fail-closed and
+idempotent, giving a crashed or failed transition a direct resume path without destructive rollback.
 
 0. Acquire, in this fixed total order: config write lock → cross-tenant manifest lock → per-account
-   refresh locks (main, then fallbacks by sorted id). Hold all through step 4. Deadlock-free by total
-   order; the manifest lock's TTL/renewal covers the awaited host write.
-1. **Inside** the locks: capture each account's custody generation; re-read the manifest, the raw
-   account rows, and the raw auth slot; compute each account's PRE-COMMIT FINGERPRINT. Any preflight
-   computed before this point is advisory and discarded (stale by construction under concurrency).
-2. Classify every enabled OAuth account while fenced. Fallbacks: C1 or C2-eligible (VALID binding,
-   USABLE vault, IDENTITY not mismatched). Main: the same three conditions **plus** the slot already
-   holds the recognise-set (§13.1) — a REAL main is `TAKEOVER_INCOMPLETE_MAIN_REAL` here, not
-   eligible. Any other class → release, **zero writes**, typed refusal naming the first failing
-   account and its class.
-3. Persist `mode=claustrum` **and** the per-account fingerprints in one config write (config lock
-   held). This is the barrier's durable marker and the only global write. Mode-first: a tombstone
-   never coexists with `mode=local` during a normal commit, so observing that pair is evidence of
-   tampering rather than an expected intermediate, and it is what makes `RESUME_TAKEOVER` possible
-   at all (under mode-last every intermediate is indistinguishable from a hand-written tombstone).
-4. Idempotent per-account commits, fallbacks only. Fallback → drop local refresh material (no-op
-   if absent); fallback rows live under our own locks, so this half is fenced. Main → **no write**
-   (§13.1): the slot must already satisfy the recognise-set at step 2 or the barrier refused before
-   step 3. (A plugin-side `client.auth.set(WRITE set)` would not be fenced against the host,
-   §12.1; a fingerprint re-read immediately before it narrows the window without closing it.)
-5. Any failure after step 3: retain the mode, keep **all** local refresh inert (the binding alone
-   inerts it, mode-independent), release, surface. The next reconcile resumes **only** incomplete
-   accounts (C2), under their own locks; it never re-runs a transition for accounts already in C1.
+   refresh locks (main, then fallbacks by sorted id). Hold all through final readback. Deadlock-free
+   by total order; lock TTLs are renewed while held.
+1. **Inside** the locks, re-read the manifest, fallback rows, and main auth slot. Recompute each
+   account's local-material fingerprint. A changed real credential refuses before any write. An
+   already tombstoned fallback is accepted as a completed transition step rather than mistaken for
+   missing local material.
+2. Verify every enabled OAuth account has a valid binding and a usable vault credential. Main must
+   already hold the recognise-set tombstone (§13.1); the plugin never writes `auth.json`. Any
+   readiness failure releases the locks with zero new writes and names the first failing account.
+3. Persist any validated legacy fallback binding into the manifest, then tombstone each fallback
+   row. Both operations are idempotent. A failure leaves completed steps in place and keeps the
+   mode local; live bindings make those partial rows dark, so no local refresh authority is regained.
+4. Re-read the target state and vault credentials. Only after every account verifies does the
+   command persist `mode=claustrum` (**mode last**), then perform a final committed readback.
+5. If final readback fails after this invocation changed the mode, revert only the mode to `local`.
+   Never restore raw config, state, or manifest snapshots: a whole-file restore can erase a login,
+   account addition, or another tenant's manifest update that committed concurrently. If mode
+   reversion itself fails, leave Claustrum mode fail-closed and surface explicit recovery guidance.
+   Re-running the command resumes from the tombstoned rows and existing bindings.
 
-Against other processes: enable/disable and **our** login path take the config lock, so they
-serialise with steps 0–4; other tenants' manifest writes take the cross-tenant lock, so they
-serialise too; a generation bump observed at step 4 aborts **that** account's commit only, the others
-proceed, and resume covers it. The host's `Auth.set` serialises with nothing we hold (§12.1).
+Against other processes, enable/disable and plugin-owned login paths take the config lock;
+manifest writes take the cross-tenant lock; and refreshes take the corresponding refresh lock. The
+host's `Auth.set` serialises with nothing we hold, which is why main tombstone installation remains
+an external precondition rather than a plugin write (§12.1).
+
+Serving is per-account after a committed transition: a late-cold main returns a typed retryable
+refusal while a healthy fallback can remain route-local. No request may fall through from a bound
+account to tombstone or local secret material.
 
 Serving is per-account and independent of the barrier: main may serve from the vault while a
 fallback sits in C3, and the reverse. Nothing about serving account A depends on account B, so no
@@ -325,10 +325,10 @@ transition table). These differ on purpose and are stated so neither is read as 
 
 1. ~~Install on `MISMATCH` for a GONE main slot~~ — moot: both ports have withdrawn plugin-side
    install into an absent slot (§5 invariants, §12.1). Converged.
-2. **Fallback artefact under custody**: we **drop** refresh material (`INERT` = absent); they write
-   tombstoned rows. One recognise rule covers both because it keys on the refresh sentinel only.
-   Do not "harmonise" by adding the sentinel to our fallback rows: that imports a masquerade risk
-   (a truthy sentinel in `access`) into a tree that currently cannot have it.
+2. **Fallback artefact under custody**: fallback rows use the same empty-access, provider-scoped
+   refresh tombstone as main. Recognition keys on the exact refresh sentinel, while the wider send
+   and refresh barriers reject every reserved-prefix value. This keeps partially completed and
+   repeated transitions observable and idempotent without putting a truthy sentinel in `access`.
 3. **Identity provenance** (§4.1): operator-asserted at the vault for us, provider-asserted for them.
 
 ## 11. Open items (external)
@@ -467,8 +467,8 @@ Two directions remain open:
 Unresolved for the cold-at-boot global-hold question. This document does not choose between these directions.
 ## 13. Implementation constraints (binding, from the 06:04Z go-ahead)
 
-1. **The host-write race stays open and the unsafe transition stays BLOCKED.** The main-slot
-   write (`client.auth.set` of the tombstone, §7 step 4 main) is not fenced against OpenCode's
+1. **The host-write race stays open and the unsafe transition stays BLOCKED.** A plugin main-slot
+   write (`client.auth.set` of the tombstone) is not fenced against OpenCode's
    `Auth.set`, and plugin-side restoration into an absent slot is withdrawn outright (C9, §12.1).
    **What the command does today, under the block:** the plugin issues **no** main-slot write at
    all. Main's tombstone is written by the operator-driven vault import
@@ -497,8 +497,8 @@ Unresolved for the cold-at-boot global-hold question. This document does not cho
    runbook** for this deployment, not a runtime dependency of the command and not part of its
    completion contract. Completion is machine-checkable inside the plugin and, under §13.1,
    contains no plugin write to main's slot: for **main**, the slot re-reads as the recognise-set
-   (the precondition, verified, not a write of ours); for each **fallback**, its local refresh
-   material re-reads as absent (our write); for every account, `credential.get` through the binding
+   (the precondition, verified, not a write of ours); for each **fallback**, its sidecar row re-reads
+   as the recognise-set tombstone (our write); for every account, `credential.get` through the binding
    succeeds, status reports `CUSTODY_SERVE`, and zero local refresh attempts are observed.
 
 Regression coverage required by the go-ahead: host-write interleaving (blocked, both directions),

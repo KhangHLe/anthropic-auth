@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import * as core from '@cortexkit/anthropic-auth-core'
 import {
@@ -6,7 +6,6 @@ import {
   type CustodyCacheCredential,
   type CustodyPreflightRefusal,
   CustodyPreflightRefusedError,
-  type CustodySidecarSnapshot,
   type ExecuteClaustrumTakeoverDeps,
   executeClaustrumTakeover,
   executeLocalExit,
@@ -171,23 +170,6 @@ function retainManifestLock(
       })
       .catch(reject)
   })
-}
-
-async function readBytes(path: string): Promise<Uint8Array | null> {
-  try {
-    return new Uint8Array(await readFile(path))
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-    throw error
-  }
-}
-
-async function restoreBytes(path: string, bytes: Uint8Array | null) {
-  if (bytes === null) {
-    await rm(path, { force: true })
-    return
-  }
-  await writeFile(path, bytes, { mode: 0o600 })
 }
 
 export function createLiveCustodyDeps(input: {
@@ -457,11 +439,6 @@ export function createLiveCustodyDeps(input: {
           )
         },
         isCommitted: (plan: ClaustrumTakeoverPlan) => verify(plan, true),
-        snapshotSidecars: async (): Promise<CustodySidecarSnapshot> => ({
-          config: await readBytes(input.storagePath),
-          state: await readBytes(core.getAccountStatePath(input.storagePath)),
-          manifest: await readBytes(manifestPath),
-        }),
         writeManifestBindings: async (plan: ClaustrumTakeoverPlan) => {
           if (!manifestLease)
             throw new Error('custody manifest lock is not held')
@@ -506,27 +483,6 @@ export function createLiveCustodyDeps(input: {
         },
         verifyTarget: (plan: ClaustrumTakeoverPlan) => verify(plan, false),
         verifyCommitted: (plan: ClaustrumTakeoverPlan) => verify(plan, true),
-        restoreSidecars: async (snapshot: CustodySidecarSnapshot) => {
-          await restoreBytes(input.storagePath, snapshot.config)
-          await restoreBytes(
-            core.getAccountStatePath(input.storagePath),
-            snapshot.state,
-          )
-          if (snapshot.manifest !== undefined)
-            await restoreBytes(manifestPath, snapshot.manifest)
-        },
-        verifyRollback: async (snapshot: CustodySidecarSnapshot) =>
-          Buffer.from((await readBytes(input.storagePath)) ?? []).equals(
-            Buffer.from(snapshot.config ?? []),
-          ) &&
-          Buffer.from(
-            (await readBytes(core.getAccountStatePath(input.storagePath))) ??
-              [],
-          ).equals(Buffer.from(snapshot.state ?? [])) &&
-          (snapshot.manifest === undefined ||
-            Buffer.from((await readBytes(manifestPath)) ?? []).equals(
-              Buffer.from(snapshot.manifest ?? []),
-            )),
         setMode: (mode) =>
           core.setClaustrumModePersistent(mode, input.storagePath),
       }

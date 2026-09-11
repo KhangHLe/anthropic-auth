@@ -11,6 +11,7 @@ import {
   generateRelayToken,
   getAccountStatePath,
   getAccountStoragePath,
+  getClaustrumMode,
   isOAuthAccount,
   isValidApiBaseURL,
   loadAccounts,
@@ -308,6 +309,9 @@ export async function login(labelArg?: string, deps: LoginDeps = {}) {
   const ask = deps.prompt ?? prompt
   const authorizeImpl = deps.authorize ?? authorize
   const exchangeImpl = deps.exchange ?? exchange
+  if (getClaustrumMode(await loadAccounts()) === 'claustrum') {
+    throw new Error('Exit Claustrum mode first: /claude-account local')
+  }
   const label =
     labelArg?.trim() || (await ask('Fallback account label (optional): '))
   const authorization = await authorizeImpl('max')

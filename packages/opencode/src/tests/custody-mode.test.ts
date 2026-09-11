@@ -652,16 +652,11 @@ describe('custody mode', () => {
     }
   })
 
-  test('custody: takeover restores raw sidecars when a staged write fails', async () => {
+  test('custody: staged failure preserves completed writes for fail-closed resume', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
-    const before = {
-      config: new TextEncoder().encode('{"accounts":["before"]}\n'),
-      state: new TextEncoder().encode('{"state":"before"}\n'),
-    }
-    let config = before.config.slice()
-    let state = before.state.slice()
+    let sidecar = 'real'
+    let concurrentAccount = 'preserved'
     let mode = 'local'
-    const writes: string[] = []
 
     const error = await executeClaustrumTakeover(plan, {
       locks: {
@@ -677,52 +672,34 @@ describe('custody mode', () => {
           ? core.custodyTombstoneOAuth('anthropic')
           : real('access-work-secret', 'refresh-work-secret'),
       isCommitted: async () => false,
-      snapshotSidecars: async () => ({
-        config: config.slice(),
-        state: state.slice(),
-      }),
       writeManifestBindings: async () => {},
-      writeSidecarAccount: async (account) => {
-        writes.push(account.id)
-        config = new TextEncoder().encode(`{"bound":"${account.id}"}\n`)
-        if (account.id === 'work') throw new Error('disk full')
-        state = new TextEncoder().encode(`{"inert":"${account.id}"}\n`)
+      writeSidecarAccount: async () => {
+        sidecar = 'tombstone'
+        concurrentAccount = 'preserved'
+        throw new Error('disk full')
       },
       verifyTarget: async () => true,
       verifyCommitted: async () => true,
-      restoreSidecars: async (snapshot) => {
-        config = snapshot.config!.slice()
-        state = snapshot.state!.slice()
-      },
-      verifyRollback: async () =>
-        JSON.stringify(config) === JSON.stringify(before.config) &&
-        JSON.stringify(state) === JSON.stringify(before.state),
       setMode: async (target) => {
         mode = target
         return 'changed'
       },
-    }).catch((error: unknown) => error)
+    }).catch((caught: unknown) => caught)
 
     expect(error).toMatchObject({
       code: 'custody_transition_failed',
       stage: 'write_sidecar',
       accountId: 'work',
     })
-    expect(writes).toEqual(['work'])
-    expect(config).toEqual(before.config)
-    expect(state).toEqual(before.state)
+    expect(sidecar).toBe('tombstone')
+    expect(concurrentAccount).toBe('preserved')
     expect(mode).toBe('local')
     expect(JSON.stringify(error)).not.toContain('access-work-secret')
   })
 
-  test('custody: throwing committed verifier reverts mode before restoring sidecars', async () => {
+  test('custody: throwing committed verifier reverts only a newly changed mode', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
-    const before = {
-      config: new TextEncoder().encode('{"access":"access-work-secret"}\n'),
-      state: new TextEncoder().encode('{"refresh":"refresh-work-secret"}\n'),
-    }
-    let config = before.config.slice()
-    let state = before.state.slice()
+    let sidecar = 'real'
     let mode: 'local' | 'claustrum' = 'local'
 
     const error = await executeClaustrumTakeover(plan, {
@@ -739,28 +716,15 @@ describe('custody mode', () => {
           ? core.custodyTombstoneOAuth('anthropic')
           : real('access-work-secret', 'refresh-work-secret'),
       isCommitted: async () => false,
-      snapshotSidecars: async () => ({
-        config: config.slice(),
-        state: state.slice(),
-      }),
       writeManifestBindings: async () => {},
       writeSidecarAccount: async () => {
-        config = new TextEncoder().encode('{"access":""}\n')
-        state = new TextEncoder().encode('{"refresh":"claustrum-tombstone"}\n')
+        sidecar = 'tombstone'
       },
       verifyTarget: async () => true,
       verifyCommitted: async () => {
         throw new Error('cache read failed')
       },
-      restoreSidecars: async (snapshot) => {
-        expect(mode).toBe('local')
-        config = snapshot.config!.slice()
-        state = snapshot.state!.slice()
-      },
-      verifyRollback: async () =>
-        JSON.stringify(config) === JSON.stringify(before.config) &&
-        JSON.stringify(state) === JSON.stringify(before.state),
-      setMode: async (target: 'local' | 'claustrum') => {
+      setMode: async (target) => {
         mode = target
         return 'changed'
       },
@@ -768,17 +732,15 @@ describe('custody mode', () => {
 
     expect(error).toMatchObject({
       code: 'custody_transition_failed',
-      stage: 'write_sidecar',
+      stage: 'post_commit_readback',
     })
     expect(mode).toBe('local')
-    expect(config).toEqual(before.config)
-    expect(state).toEqual(before.state)
+    expect(sidecar).toBe('tombstone')
   })
 
-  test('custody: failed committed readback leaves sidecars tombstoned when mode revert fails', async () => {
+  test('custody: failed committed readback remains fail-closed when mode revert fails', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
     let mode: string = 'local'
-    let restored = false
 
     const error = await executeClaustrumTakeover(plan, {
       locks: {
@@ -794,15 +756,10 @@ describe('custody mode', () => {
           ? core.custodyTombstoneOAuth('anthropic')
           : real('access-work-secret', 'refresh-work-secret'),
       isCommitted: async () => false,
-      snapshotSidecars: async () => ({ config: null, state: null }),
       writeManifestBindings: async () => {},
       writeSidecarAccount: async () => {},
       verifyTarget: async () => true,
       verifyCommitted: async () => false,
-      restoreSidecars: async () => {
-        restored = true
-      },
-      verifyRollback: async () => true,
       setMode: async (target: 'local' | 'claustrum') => {
         if (target === 'local') throw new Error('disk full')
         mode = target
@@ -816,12 +773,10 @@ describe('custody mode', () => {
     })
     expect(String(error)).toContain('mode is claustrum and unverified')
     expect(mode).toBe('claustrum')
-    expect(restored).toBe(false)
   })
 
   test('custody: takeover refuses changed local material before any write', async () => {
     const plan = await preflightClaustrumTakeover(preflightInput())
-    let snapshots = 0
     let writes = 0
     const error = await executeClaustrumTakeover(plan, {
       locks: {
@@ -837,10 +792,6 @@ describe('custody mode', () => {
           ? core.custodyTombstoneOAuth('anthropic')
           : real('changed-access', 'changed-refresh'),
       isCommitted: async () => false,
-      snapshotSidecars: async () => {
-        snapshots++
-        return { config: null, state: null }
-      },
       writeManifestBindings: async () => {
         writes++
       },
@@ -849,8 +800,6 @@ describe('custody mode', () => {
       },
       verifyTarget: async () => true,
       verifyCommitted: async () => true,
-      restoreSidecars: async () => {},
-      verifyRollback: async () => true,
       setMode: async () => 'changed',
     }).catch((caught: unknown) => caught)
 
@@ -859,7 +808,6 @@ describe('custody mode', () => {
       stage: 'reverify_fingerprint',
       accountId: 'work',
     })
-    expect(snapshots).toBe(0)
     expect(writes).toBe(0)
   })
 
@@ -983,6 +931,26 @@ describe('custody mode', () => {
       ])
       expect(hostReads.length).toBeGreaterThan(1)
       expect(deps.hostAuth).not.toHaveProperty('set')
+
+      await expect(
+        runClaustrumTakeoverCommand(
+          {
+            storagePath,
+            loadStorage: () => core.loadAccounts(storagePath),
+            getCache: async () => ({
+              get: (handle: string, minTtlMs?: number) =>
+                cache.get(handle, minTtlMs ?? 0),
+            }),
+            latestGetAuth: async () => core.custodyTombstoneOAuth('anthropic'),
+            now: () => now,
+            fallbackManager: fallbackManager as never,
+            refreshManifest: async () => {},
+          },
+          'claustrum',
+        ),
+      ).resolves.toEqual({
+        text: 'Claustrum custody already committed for: main, work.',
+      })
     } finally {
       await rm(directory, { recursive: true, force: true })
     }

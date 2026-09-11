@@ -6,6 +6,7 @@ import {
   addAccountPersistent,
   custodyTombstoneKey,
   getAccountStatePath,
+  loadAccounts,
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 
@@ -116,6 +117,37 @@ describe('CLI api add', () => {
 })
 
 describe('CLI login', () => {
+  test('refuses before authorization while global Claustrum custody is committed', async () => {
+    const accountPath = join(tempDir, 'anthropic-auth.json')
+    await saveAccounts(
+      {
+        version: 1,
+        accounts: [],
+        claustrum: { mode: 'claustrum' },
+      },
+      accountPath,
+    )
+    let authorizeCalls = 0
+
+    await expect(
+      withAccountEnv(accountPath, {}, () =>
+        login('blocked', {
+          authorize: async () => {
+            authorizeCalls += 1
+            throw new Error('authorization should not start')
+          },
+          prompt: async () => {
+            throw new Error('prompt should not run')
+          },
+        }),
+      ),
+    ).rejects.toThrow('Exit Claustrum mode first')
+    expect(authorizeCalls).toBe(0)
+    await expect(loadAccounts(accountPath)).resolves.toMatchObject({
+      accounts: [],
+    })
+  })
+
   test('clears the matching custody binding after fallback OAuth login', async () => {
     const accountPath = join(tempDir, 'anthropic-auth.json')
     const manifestPath = join(tempDir, 'handles.json')

@@ -3895,6 +3895,7 @@ describe('fallback Claustrum credential resolution', () => {
   }
 
   test('CacheKeep prewarm serves and reports a resident vault credential', async () => {
+    const fallbackHandle = `ckh_${'K'.repeat(43)}`
     const originalNow = Date.now
     const originalRuntimeOverrides = pluginRuntimeOverrides
     let now = 1_000
@@ -3917,13 +3918,18 @@ describe('fallback Claustrum credential resolution', () => {
       }
       process.env.OPENCODE_ANTHROPIC_AUTH_DISABLE_PROFILE_HYDRATION = '1'
       const storage = fallbackWithClaustrum({
-        claustrumHandle: 'handle-cachekeep-prewarm',
-        claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+        label: 'fallback-1',
+        ...custodyTombstoneOAuth('anthropic'),
+        claustrum: { mode: 'claustrum' },
       } as never)
       storage.claudeCache = { enabled: true, mode: 'hybrid' }
       storage.cacheKeep = { enabled: true, always: true, subagents: true }
       storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
       await useTempAccountFile(storage)
+      await writeManifest([
+        { label: 'main', handle: manifestHandle },
+        { label: 'fallback-1', handle: fallbackHandle },
+      ])
       const connector = connectorFor(calls, (method) => {
         if (method === 'credential.get')
           return credentialResponse(
@@ -3966,13 +3972,7 @@ describe('fallback Claustrum credential resolution', () => {
         claustrumConnector: connector,
       })
       const result = await plugin.auth.loader(
-        () =>
-          Promise.resolve({
-            type: 'oauth' as const,
-            access: 'main-access',
-            refresh: 'main-refresh',
-            expires: now + 100_000,
-          }),
+        () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
         { models: {} },
       )
       await (
@@ -4210,15 +4210,21 @@ describe('fallback Claustrum credential resolution', () => {
   })
 
   test('profile hydration serves a resident vault credential', async () => {
+    const fallbackHandle = `ckh_${'H'.repeat(43)}`
     const calls: CredentialCall[] = []
     const profileStarted = deferred()
     let profileUsedVault = false
     let profileUsedSidecar = false
     const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-profile-hydration',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      label: 'fallback-1',
+      ...custodyTombstoneOAuth('anthropic'),
+      claustrum: { mode: 'claustrum' },
     } as never)
     await useTempAccountFile(storage)
+    await writeManifest([
+      { label: 'main', handle: manifestHandle },
+      { label: 'fallback-1', handle: fallbackHandle },
+    ])
     const connector = connectorFor(calls, (method) => {
       if (method === 'credential.get')
         return credentialResponse(
@@ -4257,13 +4263,7 @@ describe('fallback Claustrum credential resolution', () => {
       claustrumConnector: connector,
     })
     await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
       { models: {} },
     )
     await withDeadlockGuard(
@@ -22384,12 +22384,22 @@ describe('killswitch fetch gate', () => {
 
 describe('claude-prime direct request', () => {
   const originalFetch = globalThis.fetch
-  const originalSetInterval = globalThis.setInterval
+  const primeMainHandle = `ckh_${'Q'.repeat(43)}`
+  const primeVaultHandle = `ckh_${'V'.repeat(43)}`
+  const primeColdHandle = `ckh_${'C'.repeat(43)}`
+  const prime401Handle = `ckh_${'R'.repeat(43)}`
+
+  async function writePrimeCustodyManifest(
+    label: string,
+    fallbackHandle: string,
+  ) {
+    await writeSharedManifest(tempConfigDir!, [
+      { label: 'main', handle: primeMainHandle },
+      { label, handle: fallbackHandle },
+    ])
+  }
 
   beforeEach(async () => {
-    globalThis.setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    ) as unknown as typeof setInterval
     // Marker dir is shared across processes; sweep leftovers so a prior
     // suite's fire doesn't suppress the next suite's claim.
     await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
@@ -22400,7 +22410,6 @@ describe('claude-prime direct request', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch
-    globalThis.setInterval = originalSetInterval
   })
 
   function primeCredentialResponse(
@@ -22550,6 +22559,98 @@ describe('claude-prime direct request', () => {
 
     // Quota fresh-check fired before the request
     expect(quotaCalls).toBeGreaterThanOrEqual(1)
+  })
+
+  test('vault-served main prime uses only the resident credential for quota and fire', async () => {
+    const mainHandle = `ckh_${'P'.repeat(43)}`
+    const now = Date.now() - 60_000
+    const past = now - 120_000
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        claustrum: { mode: 'claustrum' },
+        quota: {
+          enabled: true,
+          checkIntervalMinutes: 5,
+          minimumRemaining: { five_hour: 10, seven_day: 20 },
+          failClosedOnUnknownQuota: true,
+          mainQuota: {
+            five_hour: {
+              usedPercent: 0,
+              remainingPercent: 100,
+              resetsAt: new Date(past).toISOString(),
+              checkedAt: 1,
+            },
+          },
+          mainQuotaCheckedAt: 1,
+          mainQuotaToken: 'fp-main',
+        },
+        prime: { enabled: true },
+      }),
+    )
+    await writeSharedManifest(tempConfigDir!, [
+      { label: 'main', handle: mainHandle },
+    ])
+
+    const credentialCalls: CredentialCall[] = []
+    const authorizations: string[] = []
+    let tokenEndpointCalls = 0
+    globalThis.fetch = mock((input: unknown, init?: RequestInit) => {
+      const url = extractUrl(input as string | URL | Request)
+      const authorization =
+        new Headers(init?.headers).get('authorization') ?? ''
+      if (url.includes('/claude_cli/bootstrap')) {
+        return Promise.resolve(
+          Response.json({ oauth_account: { account_uuid: 'vault-main-uuid' } }),
+        )
+      }
+      if (url.includes('/api/oauth/usage')) {
+        authorizations.push(authorization)
+        return freshPrimeQuotaResponse({
+          five_hour: {
+            utilization: 0,
+            resets_at: new Date(now - 1_000).toISOString(),
+          },
+        })
+      }
+      if (url.includes('/v1/messages')) {
+        authorizations.push(authorization)
+        return Promise.resolve(
+          Response.json({ usage: { input_tokens: 20, output_tokens: 1 } }),
+        )
+      }
+      if (url.includes('/v1/oauth/token')) tokenEndpointCalls += 1
+      return Promise.resolve(new Response('not-mocked', { status: 599 }))
+    }) as unknown as typeof fetch
+
+    const plugin = await getPlugin(undefined, undefined, {
+      claustrumConnector: connectorFor(credentialCalls, (method) =>
+        method === 'credential.get'
+          ? credentialResponse(
+              'vault-main-prime-access',
+              71,
+              Date.now() + 5 * 60 * 60_000,
+            )
+          : { result: {} },
+      ),
+    })
+    await plugin.auth.loader(
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
+      { models: {} },
+    )
+    const manager = (plugin as any).__primeManager
+    await manager.tick()
+
+    expect(authorizations).toContain('Bearer vault-main-prime-access')
+    expect(authorizations).not.toContain('Bearer ')
+    expect(authorizations).not.toContain(
+      `Bearer ${custodyTombstoneOAuth('anthropic').refresh}`,
+    )
+    expect(tokenEndpointCalls).toBe(0)
+    expect(
+      credentialCalls.filter((call) => call.method === 'credential.get').length,
+    ).toBeGreaterThan(0)
+    await plugin.dispose?.()
   })
 
   test('main prime uses main OAuth token + Anthropic identity headers', async () => {
@@ -23042,11 +23143,8 @@ describe('claude-prime direct request', () => {
         accounts: [
           {
             id: 'work-alt',
-            type: 'oauth',
-            access: 'sidecar-prime-canary',
-            refresh: 'sidecar-prime-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-            claustrumHandle: 'prime-vault-handle',
+            label: 'work-alt',
+            ...custodyTombstoneOAuth('anthropic'),
             quota: {
               five_hour: {
                 usedPercent: 0,
@@ -23063,18 +23161,21 @@ describe('claude-prime direct request', () => {
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           failClosedOnUnknownQuota: true,
         },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         prime: { enabled: true },
       }),
     )
+    await writePrimeCustodyManifest('work-alt', primeVaultHandle)
 
     const credentialCalls: Array<{
       method: string
       params: Record<string, unknown>
     }> = []
-    const connector = primeConnector(credentialCalls, (method) => {
+    const connector = primeConnector(credentialCalls, (method, params) => {
       if (method === 'credential.get') {
-        return primeCredentialResponse('vault-prime-access', 101)
+        return params.handle === primeMainHandle
+          ? primeCredentialResponse('vault-main-access', 100)
+          : primeCredentialResponse('vault-prime-access', 101)
       }
       return { result: {} }
     })
@@ -23110,13 +23211,7 @@ describe('claude-prime direct request', () => {
       claustrumConnector: connector,
     })
     await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
       { models: {} },
     )
     const mgr = (plugin as any).__primeManager
@@ -23144,11 +23239,8 @@ describe('claude-prime direct request', () => {
         accounts: [
           {
             id: 'work-alt',
-            type: 'oauth',
-            access: 'sidecar-cold-canary',
-            refresh: 'sidecar-cold-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-            claustrumHandle: 'prime-cold-handle',
+            label: 'work-alt',
+            ...custodyTombstoneOAuth('anthropic'),
             quota: dueQuota,
           },
         ],
@@ -23158,22 +23250,29 @@ describe('claude-prime direct request', () => {
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           failClosedOnUnknownQuota: true,
         },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         prime: { enabled: true },
       }),
     )
+    await writePrimeCustodyManifest('work-alt', primeColdHandle)
 
     const credentialCalls: Array<{
       method: string
       params: Record<string, unknown>
     }> = []
-    const connector = primeConnector(credentialCalls, (method) => {
+    const connector = primeConnector(credentialCalls, (method, params) => {
       if (method === 'credential.get') {
-        return primeCredentialResponse(
-          'expired-vault-prime-access',
-          102,
-          Date.now() - 1,
-        )
+        return params.handle === primeMainHandle
+          ? primeCredentialResponse(
+              'vault-main-access',
+              101,
+              Date.now() + 5 * 60 * 60_000,
+            )
+          : primeCredentialResponse(
+              'expired-vault-prime-access',
+              102,
+              Date.now() - 1,
+            )
       }
       return { result: {} }
     })
@@ -23194,13 +23293,7 @@ describe('claude-prime direct request', () => {
       claustrumConnector: connector,
     })
     await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
       { models: {} },
     )
     const mgr = (plugin as any).__primeManager
@@ -23249,11 +23342,8 @@ describe('claude-prime direct request', () => {
         accounts: [
           {
             id: 'work-alt',
-            type: 'oauth',
-            access: 'sidecar-401-canary',
-            refresh: 'sidecar-401-refresh',
-            expires: Date.now() + 5 * 60 * 60_000,
-            claustrumHandle: 'prime-401-handle',
+            label: 'work-alt',
+            ...custodyTombstoneOAuth('anthropic'),
             quota: dueQuota,
           },
         ],
@@ -23263,18 +23353,22 @@ describe('claude-prime direct request', () => {
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           failClosedOnUnknownQuota: true,
         },
-        claustrum: { accounts: { 'work-alt': { enabled: true } } },
+        claustrum: { mode: 'claustrum' },
         prime: { enabled: true },
       }),
     )
+    await writePrimeCustodyManifest('work-alt', prime401Handle)
 
     const credentialCalls: Array<{
       method: string
       params: Record<string, unknown>
     }> = []
     let rotated = false
-    const connector = primeConnector(credentialCalls, (method) => {
+    const connector = primeConnector(credentialCalls, (method, params) => {
       if (method !== 'credential.get') return { result: {} }
+      if (params.handle === primeMainHandle) {
+        return primeCredentialResponse('vault-main-access', 102)
+      }
       return primeCredentialResponse(
         rotated ? 'vault-prime-new-access' : 'vault-prime-401-access',
         rotated ? 104 : 103,
@@ -23303,13 +23397,7 @@ describe('claude-prime direct request', () => {
       claustrumConnector: connector,
     })
     await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth',
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
       { models: {} },
     )
     const mgr = (plugin as any).__primeManager
@@ -23317,9 +23405,9 @@ describe('claude-prime direct request', () => {
     const tick = mgr.tick()
     await requestEntered.promise
     const cache = plugin.__claustrumCredentialCache
-    cache.invalidate('prime-401-handle', 103)
+    cache.invalidate(prime401Handle, 103)
     rotated = true
-    await cache.get('prime-401-handle')
+    await cache.get(prime401Handle)
     releaseResponse.resolve()
     await tick
 
@@ -23327,7 +23415,7 @@ describe('claude-prime direct request', () => {
     expect(credentialCalls).toContainEqual({
       method: 'credential.report_auth_failure',
       params: {
-        handle: 'prime-401-handle',
+        handle: prime401Handle,
         provider_status: 401,
         record_version: 103,
         reporter_source: 'direct',

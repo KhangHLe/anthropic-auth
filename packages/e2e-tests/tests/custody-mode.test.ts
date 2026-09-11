@@ -229,9 +229,111 @@ describe('custody mode', () => {
     expect(harness.anthropic.requests()).toHaveLength(0)
   }, 120_000)
 
-  test.todo(
-    'covers late cold main refusal at packages/opencode/src/index.ts:2491-2493; needs a deterministic short-TTL daemon path or clock seam',
-  )
+  it('fails closed when a previously warm main becomes cold after a served 401', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))
+    roots.push(root)
+    const mainHandle = `ckh_${'L'.repeat(43)}`
+    const manifestPath = join(root, 'claustrum-handles.json')
+    const credentials = {
+      [mainHandle]: {
+        payload: JSON.stringify({ access_token: 'vault-main-late-cold' }),
+        account_id: 'account-main',
+        record_version: 31,
+        expires_at_ms: Date.now() + 60 * 60 * 1000,
+        cold: false,
+      },
+    }
+    const daemon = await startFakeClaustrumDaemon({
+      directory: root,
+      credentials,
+    })
+    daemons.push(daemon)
+    await writeCustodyHandleManifestEntry({
+      path: manifestPath,
+      entry: {
+        label: 'main',
+        handle: mainHandle,
+        credentialId: custodyCredentialId('main'),
+      },
+    })
+    harness = await E2EHarness.create({
+      childEnv: {
+        OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE:
+          daemon.connectionFile,
+        CLAUSTRUM_OPENCODE_HANDLES: manifestPath,
+        OPENCODE_AUTH_CONTENT: JSON.stringify({
+          anthropic: {
+            type: 'oauth',
+            access: '',
+            refresh: custodyTombstoneKey('anthropic'),
+            expires: 0,
+          },
+        }),
+      },
+      beforeSpawn: async (env) => {
+        const accountPath = join(env.configDir, 'anthropic-auth.json')
+        await saveAccounts(
+          {
+            version: 1,
+            accounts: [],
+            claustrum: { handlesFile: manifestPath },
+          },
+          accountPath,
+        )
+        await setClaustrumModePersistent('claustrum', accountPath)
+      },
+    })
+
+    // Let the first provider turn warm v31, then make the daemon cold after
+    // it has answered credential.get. That turn still uses the resident
+    // credential; its 401 invalidates v31, and the next lookup observes cold.
+    harness.script([
+      {
+        type: 'error',
+        status: 401,
+        errorType: 'authentication_error',
+        message: 'expired vault access',
+      },
+    ])
+    const firstSession = await harness.createSession()
+    const firstPrompt = harness.sendPrompt(
+      firstSession,
+      'invalidate the warm main record',
+    )
+    await daemon.waitForCredentialGet(mainHandle)
+    credentials[mainHandle]!.cold = true
+    await firstPrompt
+    expect(harness.anthropic.requests()).toHaveLength(2)
+    expect(
+      harness.anthropic.requests().every(
+        (request) =>
+          request.headers.authorization === 'Bearer vault-main-late-cold',
+      ),
+    ).toBe(true)
+    await harness.waitFor(
+      () => daemon.reportAuthFailures.length === 1,
+      15_000,
+    )
+    expect(daemon.reportAuthFailures).toContainEqual({
+      handle: mainHandle,
+      provider_status: 401,
+      record_version: 31,
+      reporter_source: 'direct',
+    })
+
+    const secondSession = await harness.createSession()
+    await harness.startPrompt(
+      secondSession,
+      'the main vault record is now cold',
+    )
+    try {
+      await harness.waitForSessionStatusType(secondSession, 'retry', 15_000)
+      expect(harness.anthropic.requests()).toHaveLength(2)
+    } finally {
+      await harness.abortSession(secondSession)
+    }
+    expect(harness.anthropic.tokenRequests()).toBe(0)
+  }, 120_000)
 
   it('reports a fallback 401 against its own served vault record', async () => {
     const root = await mkdtemp(join(tmpdir(), 'anthropic-auth-e2e-custody-'))

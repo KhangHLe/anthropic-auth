@@ -3061,11 +3061,12 @@ const anthropicAuthPlugin = async (
   // OpenCode processes via atomic marker claim. In-process manager mirrors the
   // cacheKeep singleton shape; cross-process exclusivity is the marker's job.
 
-  // Obtain a CURRENT main access token via the existing refresh path
-  // (M2). If the cached auth has no access or the token is expired, refresh
-  // first; only fail when the refresh path itself fails. Returns the live
-  // token so the fresh-check and the fire path use the same value.
-  async function getCurrentMainAccessToken(): Promise<string> {
+  // Resolve one current main credential for Prime. In Claustrum mode the
+  // OpenCode slot is an inert tombstone, so both quota checks and fires must
+  // use the resident vault credential and must never enter local refresh.
+  async function getCurrentMainCredential(): Promise<
+    ClaustrumAccessResolution & { accessToken: string }
+  > {
     if (!latestGetAuth) {
       throw new Error('prime: main auth loader is not available')
     }
@@ -3073,14 +3074,26 @@ const anthropicAuthPlugin = async (
     if (auth.type !== 'oauth') {
       throw new Error('prime: main account is not an OAuth account')
     }
+    const storage = await loadAccounts(accountStoragePath)
+    if (getClaustrumMode(storage) === 'claustrum') {
+      const resolved = resolveClaustrumAccess(
+        mainCustodyAccount(auth),
+        storage,
+        { warm: false },
+      )
+      if (!resolved.accessToken || !resolved.served) {
+        throw new Error('prime: main vault credential is unavailable')
+      }
+      return { ...resolved, accessToken: resolved.accessToken }
+    }
     if (auth.access && (!auth.expires || auth.expires > Date.now())) {
-      return auth.access
+      return { accessToken: auth.access }
     }
     if (!latestRefreshMainAccessToken) {
       throw new Error('prime: main token refresh unavailable')
     }
     try {
-      return await latestRefreshMainAccessToken()
+      return { accessToken: await latestRefreshMainAccessToken() }
     } catch (error) {
       if (error instanceof Error) {
         ;(
@@ -3092,13 +3105,22 @@ const anthropicAuthPlugin = async (
   }
 
   async function refreshPrimeMainQuota(): Promise<PrimeRefreshResult> {
-    const accessToken = await getCurrentMainAccessToken()
-    await resolveMainQuotaAccountIdentity(accessToken)
-    const result = await quotaManager.refreshMainWithMetadata(
-      mainQuotaAccountId,
-      accessToken,
-    )
-    return { quota: result.quota, fresh: result.fetched }
+    const credential = await getCurrentMainCredential()
+    await resolveMainQuotaAccountIdentity(credential.accessToken)
+    try {
+      const result = await quotaManager.refreshMainWithMetadata(
+        mainQuotaAccountId,
+        credential.accessToken,
+      )
+      return { quota: result.quota, fresh: result.fetched }
+    } catch (error) {
+      if (credential.served && (error as { status?: unknown }).status === 401) {
+        await reportCapturedClaustrumAuthFailure(credential.served, 'direct', {
+          preserveServedVersion: true,
+        })
+      }
+      throw error
+    }
   }
 
   async function refreshPrimeFallbackQuota(
@@ -3147,7 +3169,9 @@ const anthropicAuthPlugin = async (
         // as-is. The previous early-return-on-!auth.access made the
         // refresh arm unreachable (M2).
         try {
-          accessToken = await getCurrentMainAccessToken()
+          const credential = await getCurrentMainCredential()
+          accessToken = credential.accessToken
+          servedClaustrumCredential = credential.served
         } catch (error) {
           const isTokenRefresh =
             error instanceof Error &&

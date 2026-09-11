@@ -34,7 +34,9 @@ export type FakeClaustrumAuthFailure = {
 
 export type FakeClaustrumDaemon = {
   connectionFile: string
+  credentialGets: string[]
   reportAuthFailures: FakeClaustrumAuthFailure[]
+  waitForCredentialGet: (handle: string) => Promise<void>
   stop: () => Promise<void>
 }
 
@@ -44,6 +46,8 @@ export async function startFakeClaustrumDaemon(input: {
   connectionFile?: string
 }): Promise<FakeClaustrumDaemon> {
   const sockets = new Set<Socket>()
+  const credentialGets: string[] = []
+  const credentialGetWaiters = new Map<string, Set<() => void>>()
   const reportAuthFailures: FakeClaustrumAuthFailure[] = []
   const server = createServer((socket) => {
     sockets.add(socket)
@@ -123,10 +127,16 @@ export async function startFakeClaustrumDaemon(input: {
           const handle = request.params?.handle
           const credential =
             typeof handle === 'string' ? input.credentials[handle] : undefined
+          if (typeof handle === 'string') credentialGets.push(handle)
           if (credential?.cold) {
             writeResponse(socket, header, {
               result: { error: { code: 'cold', class: 'transient' } },
             })
+            if (typeof handle === 'string') {
+              for (const resolve of credentialGetWaiters.get(handle) ?? [])
+                resolve()
+              credentialGetWaiters.delete(handle)
+            }
             continue
           }
           writeResponse(socket, header, {
@@ -139,6 +149,11 @@ export async function startFakeClaustrumDaemon(input: {
                 }
               : { error: { code: 'not_found', class: 'permanent' } },
           })
+          if (typeof handle === 'string') {
+            for (const resolve of credentialGetWaiters.get(handle) ?? [])
+              resolve()
+            credentialGetWaiters.delete(handle)
+          }
           continue
         }
         if (request.method === 'credential.report_auth_failure') {
@@ -175,7 +190,16 @@ export async function startFakeClaustrumDaemon(input: {
 
   return {
     connectionFile,
+    credentialGets,
     reportAuthFailures,
+    async waitForCredentialGet(handle: string) {
+      if (credentialGets.includes(handle)) return
+      await new Promise<void>((resolve) => {
+        const waiters = credentialGetWaiters.get(handle) ?? new Set()
+        waiters.add(resolve)
+        credentialGetWaiters.set(handle, waiters)
+      })
+    },
     async stop() {
       for (const socket of sockets) socket.destroy()
       await new Promise<void>((resolve) => server.close(() => resolve()))
