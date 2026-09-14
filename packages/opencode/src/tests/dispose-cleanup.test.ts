@@ -11,20 +11,23 @@ import {
   saveAccounts,
 } from '@cortexkit/anthropic-auth-core'
 import { adoptPrimeManager } from '../prime-manager-registry.ts'
-// releasePrimeManager is intentionally imported via a dynamic import inside
-// each prime test so its pre-fix absence (a missing export) fails only those
-// tests rather than crashing the whole file at module load.
 import {
   createTimerTracking,
   type PluginTimerOverrides,
 } from './timer-tracking'
 
 // Spies installed on shared prototypes before the plugin factory runs;
-// restored in afterEach so unrelated tests are not affected.
-const cacheKeepStopSpy = mock(() => {})
+// restored in afterEach so unrelated tests are not affected. They call through
+// so timer-tracking assertions exercise the real teardown implementations.
 const originalCacheKeepStop = CacheKeepManager.prototype.stop
 const originalFallbackStop =
   FallbackAccountManager.prototype.stopBackgroundRefresh
+const cacheKeepStopSpy = mock(function (this: CacheKeepManager) {
+  return originalCacheKeepStop.call(this)
+})
+const fallbackStopSpy = mock(function (this: FallbackAccountManager) {
+  return originalFallbackStop.call(this)
+})
 
 const timerTracking = createTimerTracking()
 const { activeIntervals, disabledPluginTimerOverrides } = timerTracking
@@ -34,12 +37,12 @@ const originalFetch = globalThis.fetch
 
 beforeEach(async () => {
   timerTracking.reset()
-  cacheKeepStopSpy.mockReset()
+  cacheKeepStopSpy.mockClear()
+  fallbackStopSpy.mockClear()
   CacheKeepManager.prototype.stop =
     cacheKeepStopSpy as unknown as typeof CacheKeepManager.prototype.stop
-  FallbackAccountManager.prototype.stopBackgroundRefresh = mock(
-    () => {},
-  ) as unknown as typeof FallbackAccountManager.prototype.stopBackgroundRefresh
+  FallbackAccountManager.prototype.stopBackgroundRefresh =
+    fallbackStopSpy as unknown as typeof FallbackAccountManager.prototype.stopBackgroundRefresh
   const { installDefaultFetchMock } = await import('./test-fetch')
   installDefaultFetchMock()
   tempDir = await mkdtemp(join(tmpdir(), 'anthropic-dispose-test-'))
@@ -137,11 +140,7 @@ describe('dispose stops per-instance background services', () => {
 
     await plugin.dispose?.()
 
-    // The fallbackManager stop path uses its own clearIntervalImpl (which
-    // runtimeOverrides provides); a fresh spy confirms the disposal happened.
-    const fallbackStopSpy = FallbackAccountManager.prototype
-      .stopBackgroundRefresh as unknown as { mock?: { calls: unknown[] } }
-    expect(fallbackStopSpy.mock?.calls.length ?? 0).toBeGreaterThanOrEqual(1)
+    expect(fallbackStopSpy).toHaveBeenCalledTimes(1)
     // Disposing must not schedule any additional intervals for this instance.
     expect(timerTracking.disabledIntervalCalls).toBe(intervalCallsBeforeDispose)
   })
@@ -154,9 +153,32 @@ describe('dispose stops per-instance background services', () => {
 
     expect(cacheKeepStopSpy).toHaveBeenCalledTimes(1)
   })
+
+  test('dispose clears tracked fallback and main refresh intervals', async () => {
+    const plugin = await getPlugin({
+      setInterval: timerTracking.trackedSetInterval,
+      clearInterval: timerTracking.trackedClearInterval,
+    })
+    await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+
+    expect(activeIntervals.size).toBeGreaterThanOrEqual(2)
+
+    await plugin.dispose?.()
+
+    expect(activeIntervals.size).toBe(0)
+  })
 })
 
-describe('releasePrimeManager slot accounting', () => {
+describe('prime manager adoption leases', () => {
   const storageOptions = (path: string): PrimeManagerOptions => ({
     storagePath: path,
     getAccountFingerprint: async () => '0123456789abcdef',
@@ -178,21 +200,7 @@ describe('releasePrimeManager slot accounting', () => {
     }),
   })
 
-  async function importRelease(): Promise<
-    (storagePath: string, slot: string) => void
-  > {
-    const mod = await import('../prime-manager-registry.ts')
-    if (typeof mod.releasePrimeManager !== 'function') {
-      throw new Error('releasePrimeManager is not exported')
-    }
-    return mod.releasePrimeManager as (
-      storagePath: string,
-      slot: string,
-    ) => void
-  }
-
-  test('releasing one of two slots keeps the shared manager alive for the sibling', async () => {
-    const releasePrimeManager = await importRelease()
+  test('releasing one of two slots keeps the shared manager alive for the sibling', () => {
     const path = join(
       tmpdir(),
       `prime-shared-${Date.now()}-${Math.random()}.json`,
@@ -209,49 +217,33 @@ describe('releasePrimeManager slot accounting', () => {
       },
       { slot: 'slot-b', rebind: () => {} },
     )
-    expect(second).toBe(first)
-    first.start()
+    expect(second.manager).toBe(first.manager)
+    first.manager.start()
 
-    releasePrimeManager(path, 'slot-a')
+    first.release()
 
-    // The sibling still holds a slot, so the manager must still be present
-    // in the registry (verifiable by re-adopting the slot returns the same
-    // instance) AND must still be running.
-    expect(first.isStopped()).toBe(false)
-    const readopted = adoptPrimeManager(
-      path,
-      () => {
-        throw new Error('manager should still be adopted by slot-b')
-      },
-      { slot: 'slot-b', rebind: () => {} },
-    )
-    expect(readopted).toBe(first)
-
-    // Cleanup so the orphan slot-b does not leak into the next case.
-    releasePrimeManager(path, 'slot-b')
-    expect(first.isStopped()).toBe(true)
+    expect(first.manager.isStopped()).toBe(false)
+    second.release()
+    expect(first.manager.isStopped()).toBe(true)
   })
 
-  test('releasing the last slot evicts and stops the manager', async () => {
-    const releasePrimeManager = await importRelease()
+  test('releasing the last slot evicts and stops the manager', () => {
     const path = join(
       tmpdir(),
       `prime-last-slot-${Date.now()}-${Math.random()}.json`,
     )
-    const manager = adoptPrimeManager(
+    const adoption = adoptPrimeManager(
       path,
       () => new PrimeManager(storageOptions(path)),
       { slot: 'slot-solo', rebind: () => {} },
     )
-    manager.start()
+    adoption.manager.start()
 
-    releasePrimeManager(path, 'slot-solo')
+    adoption.release()
 
-    expect(manager.isStopped()).toBe(true)
-    // A subsequent adoption must construct a brand-new manager (registry entry
-    // gone), which proves the slot bookkeeping cleared the entry.
+    expect(adoption.manager.isStopped()).toBe(true)
     let constructed = 0
-    adoptPrimeManager(
+    const replacement = adoptPrimeManager(
       path,
       () => {
         constructed += 1
@@ -260,32 +252,53 @@ describe('releasePrimeManager slot accounting', () => {
       { slot: 'slot-solo', rebind: () => {} },
     )
     expect(constructed).toBe(1)
+    replacement.release()
   })
 
-  test('releasing an unknown slot is a no-op', async () => {
-    const releasePrimeManager = await importRelease()
+  test('releasing a lease twice is a no-op', () => {
     const path = join(
       tmpdir(),
-      `prime-unknown-${Date.now()}-${Math.random()}.json`,
+      `prime-idempotent-${Date.now()}-${Math.random()}.json`,
     )
-    const manager = adoptPrimeManager(
+    const adoption = adoptPrimeManager(
       path,
       () => new PrimeManager(storageOptions(path)),
       { slot: 'slot-known', rebind: () => {} },
     )
-    manager.start()
+    adoption.manager.start()
 
-    expect(() => releasePrimeManager(path, 'slot-does-not-exist')).not.toThrow()
-    expect(manager.isStopped()).toBe(false)
-    // Idempotent: second release of the same slot must also not throw.
-    releasePrimeManager(path, 'slot-known')
-    expect(() => releasePrimeManager(path, 'slot-known')).not.toThrow()
-
-    // Cleanup: the manager is already stopped from the first 'slot-known' call.
+    adoption.release()
+    expect(() => adoption.release()).not.toThrow()
+    expect(adoption.manager.isStopped()).toBe(true)
   })
 
-  test('a late release does not clobber a successor slot mapping', async () => {
-    const releasePrimeManager = await importRelease()
+  test('a late release cannot clobber a same-path successor lease', () => {
+    const path = join(
+      tmpdir(),
+      `prime-same-path-${Date.now()}-${Math.random()}.json`,
+    )
+    const predecessor = adoptPrimeManager(
+      path,
+      () => new PrimeManager(storageOptions(path)),
+      { slot: 'D', rebind: () => {} },
+    )
+    predecessor.manager.start()
+    const successor = adoptPrimeManager(
+      path,
+      () => {
+        throw new Error('same-path adoption should not construct a duplicate')
+      },
+      { slot: 'D', rebind: () => {} },
+    )
+
+    predecessor.release()
+
+    expect(successor.manager.isStopped()).toBe(false)
+    successor.release()
+    expect(successor.manager.isStopped()).toBe(true)
+  })
+
+  test('a late release cannot clobber a different-path successor lease', () => {
     const pathX = join(
       tmpdir(),
       `prime-late-x-${Date.now()}-${Math.random()}.json`,
@@ -299,49 +312,32 @@ describe('releasePrimeManager slot accounting', () => {
       `prime-late-z-${Date.now()}-${Math.random()}.json`,
     )
 
-    // Instance A adopts slot D under path X.
     const initialX = adoptPrimeManager(
       pathX,
       () => new PrimeManager(storageOptions(pathX)),
       { slot: 'D', rebind: () => {} },
     )
-    initialX.start()
-
-    // The slot is later re-adopted under path Y; adoptPrimeManager detaches
-    // it from the pathX entry and stops/evicts that entry. From here on,
-    // slot D belongs to pathY.
+    initialX.manager.start()
     const managerY = adoptPrimeManager(
       pathY,
       () => new PrimeManager(storageOptions(pathY)),
       { slot: 'D', rebind: () => {} },
     )
-    managerY.start()
-    expect(initialX.isStopped()).toBe(true)
+    managerY.manager.start()
+    expect(initialX.manager.isStopped()).toBe(true)
 
-    // Instance A's dispose arrives late and calls release for (pathX, D).
-    // The pathX entry is already gone, so the only effect should be on
-    // slotFingerprints — and ONLY if the slot still points at pathX. With
-    // the unconditional delete, this clobbers pathY's mapping for D.
-    releasePrimeManager(pathX, 'D')
+    initialX.release()
 
-    // Now adopt slot D under path Z. The previous-fingerprint lookup must
-    // still see pathY so adoptPrimeManager detaches D from managerY before
-    // binding it to a new owner.
     const managerZ = adoptPrimeManager(
       pathZ,
       () => new PrimeManager(storageOptions(pathZ)),
       { slot: 'D', rebind: () => {} },
     )
-    managerZ.start()
+    managerZ.manager.start()
+    expect(managerY.manager.isStopped()).toBe(true)
 
-    // Per-key assertion: the pathY entry must have detached D, leaving it
-    // empty (no other slots were adopted there) so it stopped and was
-    // evicted from the registry.
-    expect(managerY.isStopped()).toBe(true)
-    // A fresh adoption under path Y must construct a brand-new manager
-    // rather than reusing managerY — that proves the entry was evicted.
     let constructedUnderY = 0
-    adoptPrimeManager(
+    const reentryY = adoptPrimeManager(
       pathY,
       () => {
         constructedUnderY += 1
@@ -351,8 +347,7 @@ describe('releasePrimeManager slot accounting', () => {
     )
     expect(constructedUnderY).toBe(1)
 
-    // Cleanup so subsequent tests are not affected.
-    releasePrimeManager(pathZ, 'D')
-    releasePrimeManager(pathY, 're-entry')
+    managerZ.release()
+    reentryY.release()
   })
 })

@@ -42,6 +42,19 @@ describe('rpc-server', () => {
     expect(noAuth.status).toBe(401)
 
     pushNotification({ command: 'claude-quota', text: 'x', knobs: {} }, 's1')
+    const missingSession = await fetch(`${base}/rpc/pending-notifications`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${server.token}`,
+      },
+      body: JSON.stringify({ lastReceivedId: 0 }),
+    })
+    expect(missingSession.status).toBe(400)
+    expect(await missingSession.json()).toEqual({
+      error: 'sessionId is required',
+    })
+
     const ok = await fetch(`${base}/rpc/pending-notifications`, {
       method: 'POST',
       headers: {

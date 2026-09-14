@@ -53,7 +53,7 @@ export interface RpcNotification {
   id: number
   type: 'open-dialog'
   payload: OpenDialogPayload
-  sessionId?: string
+  sessionId: string
 }
 
 export interface ApplyRequest {

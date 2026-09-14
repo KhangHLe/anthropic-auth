@@ -90,7 +90,7 @@ function adopt(
   return adoptPrimeManager(storagePath, create, {
     slot,
     rebind,
-  })
+  }).manager
 }
 
 describe('prime manager registry lifecycle', () => {

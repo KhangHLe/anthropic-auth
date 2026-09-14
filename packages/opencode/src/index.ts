@@ -261,10 +261,7 @@ import {
   localAuthFingerprint,
   persistCustodyDivergenceState,
 } from './local-login.ts'
-import {
-  adoptPrimeManager,
-  releasePrimeManager,
-} from './prime-manager-registry.ts'
+import { adoptPrimeManager } from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   formatKillswitchBlockMessage,
@@ -284,7 +281,11 @@ import {
   type OpenDialogPayload,
 } from './rpc/protocol.ts'
 import { getRpcDir } from './rpc/rpc-dir.ts'
-import { type RpcServerHandle, startRpcServer } from './rpc/rpc-server.ts'
+import { startRpcServer } from './rpc/rpc-server.ts'
+import {
+  adoptRpcServer,
+  type RpcServerAdoption,
+} from './rpc/server-registry.ts'
 import {
   resolveContentFilterFallbackMode,
   type ServerSideFallbackOutcome,
@@ -1084,6 +1085,8 @@ const anthropicAuthPlugin = async (
   const pendingRecoveryDesktopNotices = new Map<string, string>()
   const desktopNoticeFlushes = new Map<string, Promise<void>>()
   const desktopNoticeSafeSessions = new Set<string>()
+  const desktopNoticeLatestUserMessages = new Map<string, string>()
+  const desktopNoticeIdleUserMessages = new Map<string, string>()
   const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
     path:
@@ -3354,7 +3357,7 @@ const anthropicAuthPlugin = async (
     setTimeoutImpl: runtimeTimers.setTimeout,
     clearTimeoutImpl: runtimeTimers.clearTimeout,
   }
-  const primeManager: PrimeManager = adoptPrimeManager(
+  const primeManagerAdoption = adoptPrimeManager(
     accountStoragePath,
     () => new PrimeManager(primeManagerOptions),
     {
@@ -3362,6 +3365,7 @@ const anthropicAuthPlugin = async (
       rebind: (manager) => manager.updateOptions(primeManagerOptions),
     },
   )
+  const primeManager: PrimeManager = primeManagerAdoption.manager
   if (isPrimePersistentlyEnabled(initialStorage)) {
     primeManager.start()
   }
@@ -3452,28 +3456,17 @@ const anthropicAuthPlugin = async (
     setLogLevel(getPersistedLogLevel(initialStorage) ?? 'info')
   }
 
-  let rpcServer: RpcServerHandle | null = null
-  let rpcDir: string | null = null
+  let rpcServerAdoption: RpcServerAdoption | null = null
   if (ctx.directory) {
-    const rpcGlobal = globalThis as {
-      __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
-    }
-    rpcDir = getRpcDir(ctx.directory)
-    const rpcServers =
-      rpcGlobal.__anthropicAuthRpcServers ?? new Map<string, RpcServerHandle>()
-    rpcGlobal.__anthropicAuthRpcServers = rpcServers
-    const previousRpcServer = rpcServers.get(rpcDir)
-    if (previousRpcServer) {
-      await previousRpcServer.stop().catch(() => {})
-      rpcServers.delete(rpcDir)
-    }
+    const rpcDir = getRpcDir(ctx.directory)
     try {
-      rpcServer = await startRpcServer({
-        dir: rpcDir,
-        drain: drainNotifications,
-        apply: applyCommand,
-      })
-      rpcServers.set(rpcDir, rpcServer)
+      rpcServerAdoption = await adoptRpcServer(rpcDir, () =>
+        startRpcServer({
+          dir: rpcDir,
+          drain: drainNotifications,
+          apply: applyCommand,
+        }),
+      )
     } catch (error) {
       logger.warn('rpc', 'failed to start', {
         error: error instanceof Error ? error.message : String(error),
@@ -3500,6 +3493,16 @@ const anthropicAuthPlugin = async (
     // rest of the process. Each step is isolated: one failure cannot skip
     // the others.
     try {
+      if (mainBackgroundRefreshTimer) {
+        runtimeTimers.clearInterval(mainBackgroundRefreshTimer)
+        mainBackgroundRefreshTimer = null
+      }
+    } catch (error) {
+      logger.warn('main-background', 'failed to stop', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
       fallbackManager.stopBackgroundRefresh()
     } catch (error) {
       logger.warn('fallback-background', 'failed to stop', {
@@ -3514,21 +3517,15 @@ const anthropicAuthPlugin = async (
       })
     }
     try {
-      releasePrimeManager(accountStoragePath, ctx.directory ?? 'default')
+      primeManagerAdoption.release()
     } catch (error) {
       logger.warn('prime', 'failed to release slot', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
-    const rpcServers = (
-      globalThis as {
-        __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
-      }
-    ).__anthropicAuthRpcServers
-    if (!rpcServer || !rpcDir || rpcServers?.get(rpcDir) !== rpcServer) return
+    if (!rpcServerAdoption) return
     try {
-      await rpcServer.stop()
-      if (rpcServers.get(rpcDir) === rpcServer) rpcServers.delete(rpcDir)
+      await rpcServerAdoption.release()
     } catch (error) {
       logger.warn('rpc', 'failed to stop', {
         error: error instanceof Error ? error.message : String(error),
@@ -4050,11 +4047,12 @@ const anthropicAuthPlugin = async (
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
     // OpenCode awaits event handlers before it evaluates the loop exit condition.
     // Escape the post-idle session update, then probe outside that critical section.
-    const queue = pendingDesktopNotices.get(sessionId) ?? []
-    queue.push(text)
-    if (queue.length > 4) queue.splice(0, queue.length - 4)
+    // A later transition supersedes any notice that could not be delivered while
+    // the session was busy. Sending a stale "switched" notice immediately before
+    // a current "returning" notice is both noisy and can make the first ignored
+    // message interfere with delivery of the second.
     pendingDesktopNotices.delete(sessionId)
-    pendingDesktopNotices.set(sessionId, queue)
+    pendingDesktopNotices.set(sessionId, [text])
     while (pendingDesktopNotices.size > 128) {
       const oldest = pendingDesktopNotices.keys().next().value
       if (oldest) pendingDesktopNotices.delete(oldest)
@@ -5227,6 +5225,7 @@ const anthropicAuthPlugin = async (
           info?: {
             id?: string
             sessionID?: string
+            role?: string
           }
           status?: { type?: string }
           messageID?: string
@@ -5237,6 +5236,25 @@ const anthropicAuthPlugin = async (
         value.properties?.sessionID ?? info?.sessionID ?? info?.id
       if (!sessionId) return
 
+      if (value.type === 'message.updated' && info?.role === 'user') {
+        if (typeof info.id === 'string') {
+          desktopNoticeLatestUserMessages.set(sessionId, info.id)
+          if (
+            desktopNoticeSafeSessions.has(sessionId) &&
+            desktopNoticeIdleUserMessages.get(sessionId) !== info.id
+          ) {
+            // A new user message can precede OpenCode's busy status event. Revoke
+            // the idle-delivery lease immediately so an ignored notice cannot
+            // become the active request parent and duplicate a provider turn.
+            // Repeated updates for the user message that produced the current
+            // idle event are harmless and must not suppress delivery forever.
+            desktopNoticeSafeSessions.delete(sessionId)
+          }
+        } else {
+          desktopNoticeSafeSessions.delete(sessionId)
+        }
+      }
+
       if (
         value.type === 'session.status' &&
         value.properties?.status?.type !== 'idle'
@@ -5245,6 +5263,13 @@ const anthropicAuthPlugin = async (
       }
 
       if (value.type === 'session.idle') {
+        const latestUserMessageId =
+          desktopNoticeLatestUserMessages.get(sessionId)
+        if (latestUserMessageId) {
+          desktopNoticeIdleUserMessages.set(sessionId, latestUserMessageId)
+        } else {
+          desktopNoticeIdleUserMessages.delete(sessionId)
+        }
         // Defer the prompt until after this event handler returns, then verify the
         // live status map is still idle. OpenCode 1.18 no longer guarantees a
         // session.updated event after session.idle, so that event cannot be used
@@ -5270,6 +5295,8 @@ const anthropicAuthPlugin = async (
         fableRecoveryNotices.delete(sessionId)
         pendingDesktopNotices.delete(sessionId)
         desktopNoticeSafeSessions.delete(sessionId)
+        desktopNoticeLatestUserMessages.delete(sessionId)
+        desktopNoticeIdleUserMessages.delete(sessionId)
         for (const recoveryKey of pendingRecoveryDesktopNotices.keys()) {
           if (recoveryKey.startsWith(`${sessionId}\0`)) {
             pendingRecoveryDesktopNotices.delete(recoveryKey)

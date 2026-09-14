@@ -74,9 +74,15 @@ export async function startRpcServer(
         unknown
       >
       if (method === 'pending-notifications') {
+        if (
+          typeof params.sessionId !== 'string' ||
+          params.sessionId.length === 0
+        ) {
+          return json(400, { error: 'sessionId is required' })
+        }
         const messages = options.drain(
           Number(params.lastReceivedId ?? 0),
-          typeof params.sessionId === 'string' ? params.sessionId : undefined,
+          params.sessionId,
         )
         return json(200, { messages })
       }

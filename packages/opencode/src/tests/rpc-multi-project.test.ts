@@ -25,6 +25,7 @@ let previousSidebarStateFile: string | undefined
 let previousCacheKeepRegistryDir: string | undefined
 let previousQuotaFeedDir: string | undefined
 let startedRpcDirs: Set<string>
+let createdPlugins: Hooks[]
 
 const disabledPluginRuntimeOverrides = {
   setInterval: mock(
@@ -55,7 +56,7 @@ async function getPlugin(
     runtimeOverrides: typeof disabledPluginRuntimeOverrides,
   ) => ReturnType<typeof AnthropicAuthPlugin>
   startedRpcDirs.add(getRpcDir(directory))
-  return plugin(
+  const hooks = await plugin(
     {
       // @ts-expect-error: minimal mock for testing
       client: createMockClient(applyMarker),
@@ -63,6 +64,8 @@ async function getPlugin(
     },
     disabledPluginRuntimeOverrides,
   )
+  createdPlugins.push(hooks)
+  return hooks
 }
 
 async function applyViaRpc(
@@ -99,6 +102,7 @@ async function stopRpcServers() {
 beforeEach(async () => {
   testRoot = await mkdtemp(join(tmpdir(), 'aa-rpc-multi-project-'))
   startedRpcDirs = new Set()
+  createdPlugins = []
   previousRpcDir = process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
   previousAccountFile = process.env.OPENCODE_ANTHROPIC_AUTH_FILE
   previousSidebarStateFile =
@@ -127,42 +131,46 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-  await stopRpcServers()
-  for (const rpcDir of startedRpcDirs) {
-    expect(
-      (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
-    ).toBeUndefined()
-    expect(await discoverPortFile(rpcDir)).toBeNull()
+  try {
+    for (const plugin of createdPlugins.reverse()) await plugin.dispose?.()
+    for (const rpcDir of startedRpcDirs) {
+      expect(
+        (globalThis as RpcGlobal).__anthropicAuthRpcServers?.get(rpcDir),
+      ).toBeUndefined()
+      expect(await discoverPortFile(rpcDir)).toBeNull()
+    }
+  } finally {
+    await stopRpcServers()
+    if (previousRpcDir === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = previousRpcDir
+    }
+    if (previousAccountFile === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_FILE = previousAccountFile
+    }
+    if (previousSidebarStateFile === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE =
+        previousSidebarStateFile
+    }
+    if (previousCacheKeepRegistryDir === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR =
+        previousCacheKeepRegistryDir
+    }
+    if (previousQuotaFeedDir === undefined) {
+      delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
+    } else {
+      process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = previousQuotaFeedDir
+    }
+    await rm(testRoot, { recursive: true, force: true })
+    resetNotificationsForTest()
   }
-  if (previousRpcDir === undefined) {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR
-  } else {
-    process.env.OPENCODE_ANTHROPIC_AUTH_RPC_DIR = previousRpcDir
-  }
-  if (previousAccountFile === undefined) {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_FILE
-  } else {
-    process.env.OPENCODE_ANTHROPIC_AUTH_FILE = previousAccountFile
-  }
-  if (previousSidebarStateFile === undefined) {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-  } else {
-    process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE =
-      previousSidebarStateFile
-  }
-  if (previousCacheKeepRegistryDir === undefined) {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR
-  } else {
-    process.env.OPENCODE_ANTHROPIC_AUTH_CACHEKEEP_REGISTRY_DIR =
-      previousCacheKeepRegistryDir
-  }
-  if (previousQuotaFeedDir === undefined) {
-    delete process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR
-  } else {
-    process.env.OPENCODE_ANTHROPIC_AUTH_QUOTA_FEED_DIR = previousQuotaFeedDir
-  }
-  await rm(testRoot, { recursive: true, force: true })
-  resetNotificationsForTest()
 })
 
 describe('RPC server lifecycle', () => {
@@ -321,6 +329,7 @@ describe('RPC server lifecycle', () => {
     // Dispose refused to stop D1 by design; the spy wraps the real stop, so
     // invoking it clears the dangling server and its port file before afterEach.
     await stopSpy()
+    rpcGlobal.__anthropicAuthRpcServers?.delete(rpcDir)
   })
 
   test('a disposed project can start a discoverable RPC server again', async () => {

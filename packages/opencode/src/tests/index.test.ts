@@ -19074,6 +19074,20 @@ describe('auth.loader', () => {
     const firstOpus = await result.fetch(MESSAGES_URL, request)
     await firstOpus.text()
 
+    // Seed the user-message identity that produced the upcoming idle event.
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestUserMessageId,
+            sessionID: 'ses_fable_filter',
+            role: 'user',
+          },
+        },
+      },
+    })
+
     // Reproduce the host race from issue #162: an idle probe starts, then a new
     // prompt marks the session busy before the asynchronous status response
     // arrives with its now-stale idle snapshot. The notice must remain queued;
@@ -19140,11 +19154,67 @@ describe('auth.loader', () => {
     expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
     mockClient.session.messages = immediateMessages
 
+    // OpenCode can publish the new user message before its busy status update.
+    // That earlier event must also revoke the idle-delivery lease.
+    let releaseUserMessagePromptContext: (() => void) | undefined
+    mockClient.session.messages = mock(
+      () =>
+        new Promise<{ data: unknown[] }>((resolve) => {
+          releaseUserMessagePromptContext = () => {
+            void Promise.resolve(immediateMessages?.()).then((response) =>
+              resolve(response ?? { data: [] }),
+            )
+          }
+        }),
+    )
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    for (
+      let attempt = 0;
+      attempt < 100 && !releaseUserMessagePromptContext;
+      attempt++
+    ) {
+      await Bun.sleep(1)
+    }
+    expect(releaseUserMessagePromptContext).toBeDefined()
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_new_user',
+            sessionID: 'ses_fable_filter',
+            role: 'user',
+          },
+        },
+      },
+    })
+    releaseUserMessagePromptContext?.()
+    await Bun.sleep(10)
+    expect(mockClient.session.promptAsync).not.toHaveBeenCalled()
+    mockClient.session.messages = immediateMessages
+
     // A later authoritative idle signal retries the still-queued notice.
     await plugin.event?.({
       event: {
         type: 'session.idle',
         properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: 'msg_new_user',
+            sessionID: 'ses_fable_filter',
+            role: 'user',
+          },
+        },
       },
     })
     await plugin.event?.({
