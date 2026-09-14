@@ -201,7 +201,7 @@ import {
   tokenFingerprint,
   writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
-import type { Plugin } from '@opencode-ai/plugin'
+import type { Hooks, Plugin } from '@opencode-ai/plugin'
 import {
   BILLING_LINEAGE_REQUEST_HEADER,
   BillingLineageTracker,
@@ -261,7 +261,10 @@ import {
   localAuthFingerprint,
   persistCustodyDivergenceState,
 } from './local-login.ts'
-import { adoptPrimeManager } from './prime-manager-registry.ts'
+import {
+  adoptPrimeManager,
+  releasePrimeManager,
+} from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   formatKillswitchBlockMessage,
@@ -3450,23 +3453,84 @@ const anthropicAuthPlugin = async (
   }
 
   let rpcServer: RpcServerHandle | null = null
+  let rpcDir: string | null = null
   if (ctx.directory) {
     const rpcGlobal = globalThis as {
-      __anthropicAuthRpcServer?: RpcServerHandle
+      __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
     }
-    if (rpcGlobal.__anthropicAuthRpcServer) {
-      await rpcGlobal.__anthropicAuthRpcServer.stop().catch(() => {})
-      rpcGlobal.__anthropicAuthRpcServer = undefined
+    rpcDir = getRpcDir(ctx.directory)
+    const rpcServers =
+      rpcGlobal.__anthropicAuthRpcServers ?? new Map<string, RpcServerHandle>()
+    rpcGlobal.__anthropicAuthRpcServers = rpcServers
+    const previousRpcServer = rpcServers.get(rpcDir)
+    if (previousRpcServer) {
+      await previousRpcServer.stop().catch(() => {})
+      rpcServers.delete(rpcDir)
     }
     try {
       rpcServer = await startRpcServer({
-        dir: getRpcDir(ctx.directory),
+        dir: rpcDir,
         drain: drainNotifications,
         apply: applyCommand,
       })
-      rpcGlobal.__anthropicAuthRpcServer = rpcServer
+      rpcServers.set(rpcDir, rpcServer)
     } catch (error) {
       logger.warn('rpc', 'failed to start', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+  const dispose: NonNullable<Hooks['dispose']> = async () => {
+    try {
+      await quotaHeaderFeedRegistry?.dispose()
+    } catch (error) {
+      logger.warn('quota-header-feed', 'failed to dispose', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      claustrumCredentialCache?.close()
+    } catch (error) {
+      logger.warn('claustrum', 'failed to close credential cache', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    // Per-instance background services must be torn down before the RPC
+    // guard so a disposed instance never leaves its timer running for the
+    // rest of the process. Each step is isolated: one failure cannot skip
+    // the others.
+    try {
+      fallbackManager.stopBackgroundRefresh()
+    } catch (error) {
+      logger.warn('fallback-background', 'failed to stop', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      cacheKeepManager.stop()
+    } catch (error) {
+      logger.warn('cachekeep', 'failed to stop', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      releasePrimeManager(accountStoragePath, ctx.directory ?? 'default')
+    } catch (error) {
+      logger.warn('prime', 'failed to release slot', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    const rpcServers = (
+      globalThis as {
+        __anthropicAuthRpcServers?: Map<string, RpcServerHandle>
+      }
+    ).__anthropicAuthRpcServers
+    if (!rpcServer || !rpcDir || rpcServers?.get(rpcDir) !== rpcServer) return
+    try {
+      await rpcServer.stop()
+      if (rpcServers.get(rpcDir) === rpcServer) rpcServers.delete(rpcDir)
+    } catch (error) {
+      logger.warn('rpc', 'failed to stop', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -8640,10 +8704,6 @@ const anthropicAuthPlugin = async (
 
         return {}
       },
-      dispose: async () => {
-        await quotaHeaderFeedRegistry?.dispose()
-        claustrumCredentialCache?.close()
-      },
       methods: [
         {
           label: 'Claude Pro/Max',
@@ -8725,6 +8785,7 @@ const anthropicAuthPlugin = async (
         },
       ],
     },
+    dispose,
     __primeManager: primeManager,
     __quotaManager: quotaManager,
     __cacheKeepManager: cacheKeepManager,
