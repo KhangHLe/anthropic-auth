@@ -214,7 +214,10 @@ import {
   LANE_START_REQUEST_HEADER,
   LaneStartTracker,
 } from './lane-start.ts'
-import { adoptPrimeManager } from './prime-manager-registry.ts'
+import {
+  adoptPrimeManager,
+  releasePrimeManager,
+} from './prime-manager-registry.ts'
 import { resolvePromptContext } from './prompt-context.ts'
 import {
   formatKillswitchBlockMessage,
@@ -2845,6 +2848,31 @@ const anthropicAuthPlugin = async (
       claustrumCredentialCache?.close()
     } catch (error) {
       logger.warn('claustrum', 'failed to close credential cache', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    // Per-instance background services must be torn down before the RPC
+    // guard so a disposed instance never leaves its timer running for the
+    // rest of the process. Each step is isolated: one failure cannot skip
+    // the others.
+    try {
+      fallbackManager.stopBackgroundRefresh()
+    } catch (error) {
+      logger.warn('fallback-background', 'failed to stop', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      cacheKeepManager.stop()
+    } catch (error) {
+      logger.warn('cachekeep', 'failed to stop', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    try {
+      releasePrimeManager(accountStoragePath, ctx.directory ?? 'default')
+    } catch (error) {
+      logger.warn('prime', 'failed to release slot', {
         error: error instanceof Error ? error.message : String(error),
       })
     }
