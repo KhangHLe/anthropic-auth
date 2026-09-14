@@ -31,6 +31,7 @@ const PROTECTED_HEADERS = new Set([
   'x-session-affinity',
   'x-opencode-session',
   'x-anthropic-effort-plan',
+  'x-cortexkit-billing-lineage',
 ])
 
 function cacheParsed(raw: string, entries: HeaderEntries | null) {

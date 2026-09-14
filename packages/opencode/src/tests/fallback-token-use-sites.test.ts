@@ -1,22 +1,29 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   type AccountStorage,
   CACHE_KEEP_TICK_MS,
+  custodyTombstoneOAuth,
   resetCache1hState,
   resetClaudeCodeIdentityCachesForTest,
   saveAccountState,
   saveAccounts,
-  tokenFingerprint,
 } from '@cortexkit/anthropic-auth-core'
 
 import { AnthropicAuthPlugin } from '../index'
 import { LANE_START_REQUEST_HEADER } from '../lane-start'
 import { extractUrl, MESSAGES_URL } from './test-fetch'
 
-type Site = 'request' | 'quota' | 'prime' | 'cachekeep' | 'recovery' | 'profile'
+type Site =
+  | 'request'
+  | 'quota'
+  | 'prime'
+  | 'cachekeep'
+  | 'main-cachekeep'
+  | 'recovery'
+  | 'profile'
 
 type OutboundRecord = {
   url: string
@@ -94,16 +101,22 @@ function vaultToken(site: Site) {
   return `sk-ant-oat01-vault-${site}`
 }
 
-function sidecarToken(site: Site) {
-  return `sk-ant-oat01-sidecar-canary-${site}`
+function mainVaultToken(site: Site) {
+  return `sk-ant-oat01-vault-main-${site}`
 }
 
-function expectOnlyVaultToken(records: OutboundRecord[], site: Site) {
+function expectOnlyVaultToken(
+  records: OutboundRecord[],
+  site: Site,
+  diagnostics?: unknown,
+  expectedToken = vaultToken(site),
+) {
   expect(records.length, `${site}: no outbound requests`).toBeGreaterThan(0)
   for (const record of records) {
-    expect(record.authorization, `${site}: ${record.url}`).toBe(
-      `Bearer ${vaultToken(site)}`,
-    )
+    expect(
+      record.authorization,
+      `${site}: ${record.url}: ${JSON.stringify(diagnostics)}`,
+    ).toBe(`Bearer ${expectedToken}`)
     expect(record.headersHaveCanary, `${site}: canary in headers`).toBe(false)
     expect(record.bodyHasCanary, `${site}: canary in body`).toBe(false)
   }
@@ -132,15 +145,20 @@ async function createFixture(
     recovery?: boolean
     profile?: boolean
     captureIntervals?: boolean
+    mainFirst?: boolean
   } = {},
 ) {
   const now = options.now ?? Date.now()
-  const canary = `sidecar-canary-${site}`
+  const canary = custodyTombstoneOAuth('anthropic').refresh
   const vault = vaultToken(site)
+  const mainVault = mainVaultToken(site)
+  const mainProviderAccountId = `main-provider-${site}`
   const accountId = `fallback-${site}`
-  const handle = `handle-${site}`
+  const handle = `ckh_${'F'.repeat(43)}`
+  const mainHandle = `ckh_${'M'.repeat(43)}`
   const intervals: IntervalRecord[] = []
   const records: OutboundRecord[] = []
+  const credentialGets: Array<{ handle?: string; isMain: boolean }> = []
   let refusalPending = options.recovery === true
 
   if (options.now !== undefined) {
@@ -155,21 +173,25 @@ async function createFixture(
 
   const storage: AccountStorage = {
     version: 1,
+    mainAccountId: `main-slot-${site}`,
     main: {
       type: 'opencode',
       provider: 'anthropic',
-      ...(options.profile
-        ? {
-            profile: {
-              tier: 'default_claude_max_5x',
-              orgType: 'claude_team',
-              checkedAt: now,
-            },
-          }
-        : {}),
+      profile: {
+        tier: 'default_claude_max_5x',
+        orgType: 'claude_team',
+        checkedAt: now,
+        providerAccountUuid: mainProviderAccountId as never,
+      },
     },
     fallbackOn: [401, 403, 429],
-    routing: { mode: options.recovery ? 'sticky-balanced' : 'fallback-first' },
+    routing: {
+      mode: options.recovery
+        ? 'sticky-balanced'
+        : options.mainFirst
+          ? 'main-first'
+          : 'fallback-first',
+    },
     refresh: {
       enabled: true,
       intervalMinutes: 10,
@@ -183,14 +205,19 @@ async function createFixture(
           failClosedOnUnknownQuota: true,
           ...(options.recovery || options.prime
             ? {
-                mainQuota: quota(now, options.recovery ? 0 : 90),
+                mainQuota: {
+                  ...quota(now, options.recovery ? 0 : 90),
+                  accountIdentity: mainProviderAccountId,
+                },
                 mainQuotaCheckedAt: now,
-                mainQuotaToken: tokenFingerprint('main-access'),
               }
             : {}),
         }
       : { enabled: false, failClosedOnUnknownQuota: false },
-    claustrum: { mode: 'claustrum' },
+    claustrum: {
+      mode: 'claustrum',
+      handlesFile: '',
+    },
     ...(options.prime ? { prime: { enabled: true } } : {}),
     ...(options.cachekeep || options.recovery
       ? {
@@ -201,11 +228,8 @@ async function createFixture(
     accounts: [
       {
         id: accountId,
-        type: 'oauth',
-        access: sidecarToken(site),
-        refresh: `refresh-${site}`,
-        expires: now + 8 * 60 * 60_000,
-        claustrumHandle: handle,
+        label: accountId,
+        ...custodyTombstoneOAuth('anthropic'),
         ...(options.quotaSnapshot ? { quota: options.quotaSnapshot } : {}),
       },
     ],
@@ -214,6 +238,34 @@ async function createFixture(
   const directory = await mkdtemp(join(tmpdir(), `fallback-census-${site}-`))
   tempDirs.add(directory)
   const accountFile = join(directory, 'anthropic-auth.json')
+  const handlesFile = join(directory, 'opencode-handles.json')
+  storage.claustrum!.handlesFile = handlesFile
+  await writeFile(
+    handlesFile,
+    `${JSON.stringify({
+      version: 1,
+      providers: [
+        {
+          provider: 'anthropic',
+          shape: 'oauth',
+          serve: 'anthropic-auth',
+          accounts: [
+            {
+              label: 'main',
+              handle: mainHandle,
+              credential_id: 'oauth:anthropic:main',
+            },
+            {
+              label: accountId,
+              handle,
+              credential_id: `oauth:anthropic:${accountId}`,
+            },
+          ],
+        },
+      ],
+    })}\n`,
+  )
+  await chmod(handlesFile, 0o600)
   process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountFile
   process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
     directory,
@@ -234,12 +286,23 @@ async function createFixture(
 
   const connector = async () =>
     ({
-      call: async (_moduleId: string, method: string) => {
+      call: async (
+        _moduleId: string,
+        method: string,
+        params?: { handle?: string },
+      ) => {
         if (method !== 'credential.get') return { result: {} }
+        const isMain = params?.handle === mainHandle
+        credentialGets.push({ handle: params?.handle, isMain })
         return {
           result: {
             payload: Array.from(
-              new TextEncoder().encode(JSON.stringify({ access_token: vault })),
+              new TextEncoder().encode(
+                JSON.stringify({
+                  access_token: isMain ? mainVault : vault,
+                  account_uuid: isMain ? mainProviderAccountId : accountId,
+                }),
+              ),
             ),
             expires_at_ms: now + 12 * 60 * 60_000,
             record_version: 103,
@@ -275,7 +338,14 @@ async function createFixture(
     })
     if (url.includes('/claude_cli/bootstrap')) {
       return Promise.resolve(
-        Response.json({ oauth_account: { account_uuid: accountId } }),
+        Response.json({
+          oauth_account: {
+            account_uuid:
+              headers.get('authorization') === `Bearer ${mainVault}`
+                ? mainProviderAccountId
+                : accountId,
+          },
+        }),
       )
     }
     if (url.includes('/api/oauth/profile')) {
@@ -293,14 +363,20 @@ async function createFixture(
         Response.json({
           five_hour: {
             utilization: 10,
-            resets_at: new Date(now - 1_000).toISOString(),
+            resets_at: new Date(
+              now - (options.prime ? 120_000 : 1_000),
+            ).toISOString(),
           },
           seven_day: { utilization: 10 },
           limits: [
             {
               kind: 'weekly_scoped',
               group: 'weekly',
-              percent: 10,
+              percent:
+                options.recovery &&
+                headers.get('authorization') === `Bearer ${mainVault}`
+                  ? 100
+                  : 10,
               scope: { model: { display_name: 'Fable' } },
             },
           ],
@@ -360,17 +436,20 @@ async function createFixture(
   )) as any
   activePlugins.add(plugin)
   const result = await plugin.auth.loader(
-    () =>
-      Promise.resolve({
-        type: 'oauth' as const,
-        access: 'main-access',
-        refresh: 'main-refresh',
-        expires: now + 8 * 60 * 60_000,
-      }),
+    () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
     { models: {} },
   )
+  await plugin.__fallbackRefreshReady
 
-  return { accountId, intervals, plugin, records, result }
+  return {
+    accountId,
+    credentialGets,
+    intervals,
+    plugin,
+    records,
+    result,
+    storage,
+  }
 }
 
 describe('vault-served fallback outbound token census', () => {
@@ -393,14 +472,11 @@ describe('vault-served fallback outbound token census', () => {
       })
     ).text()
 
-    expectOnlyVaultToken(fixture.records, 'request')
-    const bootstrap = fixture.records.filter((record) =>
-      record.url.includes('/claude_cli/bootstrap'),
+    const messageRecords = fixture.records.filter((record) =>
+      record.url.includes('/v1/messages'),
     )
-    expect(bootstrap.length).toBeGreaterThan(0)
-    expect(
-      fixture.records.filter((record) => record.url.includes('/v1/messages')),
-    ).toHaveLength(2)
+    expectOnlyVaultToken(messageRecords, 'request', fixture.credentialGets)
+    expect(messageRecords).toHaveLength(2)
   })
 
   test.serial('fallback-manager quota poll', async () => {
@@ -427,11 +503,15 @@ describe('vault-served fallback outbound token census', () => {
     await fixture.plugin.__primeManager.tick()
 
     const fallbackRecords = fixture.records.filter(
-      (record) => record.authorization !== 'Bearer main-access',
+      (record) => record.authorization === `Bearer ${vaultToken('prime')}`,
     )
     expectOnlyVaultToken(fallbackRecords, 'prime')
     expect(
       fallbackRecords.some((record) => record.url.includes('/v1/messages')),
+      JSON.stringify({
+        fallbackRecords,
+        stats: fixture.plugin.__primeManager.stats(fixture.storage),
+      }),
     ).toBe(true)
   })
 
@@ -484,6 +564,60 @@ describe('vault-served fallback outbound token census', () => {
     expect(bootstrap.length).toBeGreaterThan(0)
   })
 
+  test.serial(
+    'CacheKeep prewarms a vault-served main without reading the tombstone',
+    async () => {
+      const now = 1_000
+      const fixture = await createFixture('main-cachekeep', {
+        now,
+        cachekeep: true,
+        captureIntervals: true,
+        mainFirst: true,
+      })
+      fixture.records.length = 0
+      const body = JSON.stringify({
+        model: 'claude-opus-4-8',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello' }],
+      })
+      await (
+        await fixture.result.fetch(MESSAGES_URL, {
+          method: 'POST',
+          headers: { 'x-session-affinity': 'main-cachekeep-census' },
+          body,
+        })
+      ).text()
+      resetClaudeCodeIdentityCachesForTest()
+      fixture.records.length = 0
+      ;(
+        fixture.intervals as IntervalRecord[] & { clock: (now: number) => void }
+      ).clock(now + 55 * 60_000)
+      const cacheKeepTick = fixture.intervals.find(
+        (interval) => interval.ms === CACHE_KEEP_TICK_MS,
+      )
+      if (!cacheKeepTick) throw new Error('missing CacheKeep interval')
+      cacheKeepTick.callback()
+      await waitFor(
+        () =>
+          fixture.records.some((record) => {
+            if (!record.url.includes('/v1/messages')) return false
+            return (
+              (JSON.parse(record.body) as { max_tokens?: number })
+                .max_tokens === 0
+            )
+          }),
+        'main CacheKeep prewarm did not run',
+      )
+
+      expectOnlyVaultToken(
+        fixture.records,
+        'main-cachekeep',
+        fixture.credentialGets,
+        mainVaultToken('main-cachekeep'),
+      )
+    },
+  )
+
   test.serial('recovery source-model prewarm', async () => {
     // Recovery and ordinary CacheKeep prewarms intentionally share prepareHeaders.
     const now = Date.now()
@@ -508,19 +642,29 @@ describe('vault-served fallback outbound token census', () => {
     const refused = await fixture.result.fetch(MESSAGES_URL, request)
     await expect(refused.text()).rejects.toThrow()
     await (await fixture.result.fetch(MESSAGES_URL, request)).text()
-    await waitFor(
-      () =>
-        fixture.records.some((record) => {
-          if (!record.url.includes('/v1/messages')) return false
-          return (
-            (JSON.parse(record.body) as { max_tokens?: number }).max_tokens ===
-            0
-          )
-        }),
-      'recovery source-model prewarm did not run',
-    )
+    try {
+      await waitFor(
+        () =>
+          fixture.records.some((record) => {
+            if (!record.url.includes('/v1/messages')) return false
+            return (
+              (JSON.parse(record.body) as { max_tokens?: number })
+                .max_tokens === 0
+            )
+          }),
+        'recovery source-model prewarm did not run',
+      )
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}: ${JSON.stringify({ records: fixture.records, credentialGets: fixture.credentialGets })}`,
+      )
+    }
 
-    expectOnlyVaultToken(fixture.records, 'recovery')
+    expectOnlyVaultToken(
+      fixture.records.filter((record) => record.url.includes('/v1/messages')),
+      'recovery',
+      fixture.credentialGets,
+    )
   })
 
   test.serial('profile hydration', async () => {

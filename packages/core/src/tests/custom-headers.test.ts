@@ -40,6 +40,7 @@ describe('custom proxy headers', () => {
         'x-safe-proxy-header': 'safe',
         authorization: 'Bearer attacker-controlled',
         'x-session-affinity': 'internal-header-reintroduced',
+        'x-cortexkit-billing-lineage': 'forged-lineage',
       }),
     )
 
@@ -47,6 +48,23 @@ describe('custom proxy headers', () => {
     expect(headers.get('anthropic-beta')).toBe('required-beta')
     expect(headers.get('x-safe-proxy-header')).toBeNull()
     expect(headers.get('x-session-affinity')).toBeNull()
+    expect(headers.get('x-cortexkit-billing-lineage')).toBeNull()
+  })
+
+  test('rejects a forged internal billing-lineage header on its own', () => {
+    const headers = new Headers({ authorization: 'Bearer route-secret' })
+
+    applyCustomHeaders(
+      headers,
+      JSON.stringify({
+        'x-safe-proxy-header': 'safe',
+        'x-cortexkit-billing-lineage': 'forged-lineage',
+      }),
+    )
+
+    expect(headers.get('authorization')).toBe('Bearer route-secret')
+    expect(headers.get('x-safe-proxy-header')).toBeNull()
+    expect(headers.get('x-cortexkit-billing-lineage')).toBeNull()
   })
 
   test('redacts malformed JSON and invalid header values from warning records', () => {

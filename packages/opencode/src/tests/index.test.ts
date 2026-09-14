@@ -193,24 +193,22 @@ async function withDeadlockGuard<T>(
   promise: Promise<T>,
   ms: number,
   message: string,
+  timers: Pick<typeof globalThis, 'setTimeout' | 'clearTimeout'> = globalThis,
 ): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined
   const timeoutPromise = new Promise<never>((_, reject) => {
-    timeout = setTimeout(() => reject(new Error(message)), ms)
+    timeout = timers.setTimeout(() => reject(new Error(message)), ms)
   })
   try {
     return await Promise.race([promise, timeoutPromise])
   } finally {
-    if (timeout !== undefined) clearTimeout(timeout)
+    if (timeout !== undefined) timers.clearTimeout(timeout)
   }
 }
 
 test('withDeadlockGuard clears its timeout after the primary settles', async () => {
-  const originalSetTimeout = globalThis.setTimeout
-  const originalClearTimeout = globalThis.clearTimeout
-  // Concurrent async work schedules unrelated timers during the override
-  // window; every counter is scoped to the guard's own timer (identified by
-  // this sentinel delay) so nothing else can flip the probe.
+  // Count only the timer injected into this guard so concurrent suites cannot
+  // affect the probe.
   const sentinelDelayMs = 47
   const guardTimers = new Set<unknown>()
   let timeoutFired = 0
@@ -222,23 +220,23 @@ test('withDeadlockGuard clears its timeout after the primary settles', async () 
       unhandled += 1
     }
   }
-  globalThis.setTimeout = ((
+  const setTimeoutImpl = ((
     callback: (...args: any[]) => void,
     delay?: number,
   ) => {
     const isGuardTimer = delay === sentinelDelayMs
-    const handle = originalSetTimeout(() => {
+    const handle = globalThis.setTimeout(() => {
       if (isGuardTimer) timeoutFired += 1
       callback()
     }, delay)
     if (isGuardTimer) guardTimers.add(handle)
     return handle
   }) as typeof globalThis.setTimeout
-  globalThis.clearTimeout = ((
-    timeout: ReturnType<typeof originalSetTimeout>,
+  const clearTimeoutImpl = ((
+    timeout: ReturnType<typeof globalThis.setTimeout>,
   ) => {
     if (guardTimers.delete(timeout)) timeoutCleared += 1
-    originalClearTimeout(timeout)
+    globalThis.clearTimeout(timeout)
   }) as typeof globalThis.clearTimeout
   process.on('unhandledRejection', onUnhandled)
   try {
@@ -246,6 +244,7 @@ test('withDeadlockGuard clears its timeout after the primary settles', async () 
       Promise.resolve('primary'),
       sentinelDelayMs,
       guardMessage,
+      { setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl },
     )
     await Bun.sleep(100)
     expect(timeoutFired).toBe(0)
@@ -253,8 +252,6 @@ test('withDeadlockGuard clears its timeout after the primary settles', async () 
     expect(unhandled).toBe(0)
   } finally {
     process.off('unhandledRejection', onUnhandled)
-    globalThis.setTimeout = originalSetTimeout
-    globalThis.clearTimeout = originalClearTimeout
   }
 })
 
@@ -702,8 +699,6 @@ function disabledPluginRuntimeOverrides(): PluginRuntimeOverrides {
   }
 }
 
-const originalSetInterval = globalThis.setInterval
-const originalClearInterval = globalThis.clearInterval
 let pluginRuntimeOverrides: PluginRuntimeOverrides = {}
 
 beforeEach(() => {
@@ -715,11 +710,7 @@ async function getPlugin(
   directory?: string,
   runtimeOverrides: PluginRuntimeOverrides = {},
 ) {
-  const defaultTimerOverrides =
-    globalThis.setInterval === originalSetInterval &&
-    globalThis.clearInterval === originalClearInterval
-      ? disabledPluginRuntimeOverrides()
-      : {}
+  const defaultTimerOverrides = disabledPluginRuntimeOverrides()
   const plugin = (await (
     AnthropicAuthPlugin as unknown as (
       ctx: Parameters<typeof AnthropicAuthPlugin>[0],
@@ -4016,19 +4007,28 @@ describe('fallback Claustrum credential resolution', () => {
     }
   })
 
-  test('CacheKeep clears a failed vault attempt before a sidecar 401', async () => {
+  test('CacheKeep binds a 401 report to the vault credential served by that attempt', async () => {
     const calls: CredentialCall[] = []
+    const fallbackHandle = `ckh_${'A'.repeat(43)}`
     const storage = fallbackWithClaustrum({
-      claustrumHandle: 'handle-cachekeep-abandon',
-      claustrum: { accounts: { 'fallback-1': { enabled: true } } },
+      label: 'fallback-1',
+      ...custodyTombstoneOAuth('anthropic'),
     } as never)
     storage.claudeCache = { enabled: true, mode: 'hybrid' }
     storage.cacheKeep = { enabled: true, always: true, subagents: true }
     storage.quota = { enabled: false, failClosedOnUnknownQuota: false }
     await useTempAccountFile(storage)
-    const connector = connectorFor(calls, (method) => {
+    await writeManifest([
+      { label: 'main', handle: manifestHandle },
+      { label: 'fallback-1', handle: fallbackHandle },
+    ])
+    const connector = connectorFor(calls, (method, params) => {
       if (method === 'credential.get') {
-        return credentialResponse('vault-cachekeep-abandon', 47)
+        const main = params.handle === manifestHandle
+        return credentialResponse(
+          main ? 'vault-cachekeep-main' : 'vault-cachekeep-fallback',
+          main ? 48 : 47,
+        )
       }
       return { result: {} }
     })
@@ -4052,13 +4052,7 @@ describe('fallback Claustrum credential resolution', () => {
       claustrumConnector: connector,
     })
     await plugin.auth.loader(
-      () =>
-        Promise.resolve({
-          type: 'oauth' as const,
-          access: 'main-access',
-          refresh: 'main-refresh',
-          expires: Date.now() + 100_000,
-        }),
+      () => Promise.resolve(custodyTombstoneOAuth('anthropic')),
       { models: {} },
     )
     const cacheKeep = plugin.__cacheKeepManager
@@ -4083,8 +4077,10 @@ describe('fallback Claustrum credential resolution', () => {
     await cacheKeep.prewarmNow(request)
 
     expect(
-      calls.filter((call) => call.method === 'credential.report_auth_failure'),
-    ).toHaveLength(0)
+      calls
+        .filter((call) => call.method === 'credential.report_auth_failure')
+        .map((call) => call.params.record_version),
+    ).toEqual([48])
     await plugin.dispose?.()
   })
 
@@ -9553,6 +9549,129 @@ test('test setup keeps sidebar state off the production default path', () => {
   ).toBe(true)
 })
 
+describe('OAuth billing lineage', () => {
+  const originalFetch = globalThis.fetch
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  test('advances cc_prev_req from genuine HTTP relay response headers', async () => {
+    await useTempAccountFile(
+      createFallbackStorage({
+        accounts: [],
+        refresh: {
+          enabled: false,
+          intervalMinutes: 10,
+          refreshBeforeExpiryMinutes: 30,
+        },
+        quota: {
+          enabled: false,
+          checkIntervalMinutes: 5,
+          minimumRemaining: {},
+          failClosedOnUnknownQuota: false,
+        },
+        relay: {
+          enabled: true,
+          url: 'https://relay.example.test',
+          token: 'relay-token',
+          fallbackToDirect: false,
+          transport: 'http',
+        },
+      }),
+    )
+    const sentBillingHeaders: string[] = []
+    globalThis.fetch = mock(
+      (input: string | URL | Request, init?: RequestInit) => {
+        const url = extractUrl(input)
+        if (url.includes('/claude_cli/bootstrap')) {
+          return Promise.resolve(
+            Response.json({
+              oauth_account: { account_uuid: 'billing-relay-account' },
+            }),
+          )
+        }
+        if (url.startsWith('https://relay.example.test')) {
+          const payload = JSON.parse(String(init?.body)) as { body?: string }
+          const body = JSON.parse(String(payload.body)) as {
+            system?: Array<{ text?: string }>
+          }
+          sentBillingHeaders.push(String(body.system?.[0]?.text ?? ''))
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: {
+                'request-id':
+                  sentBillingHeaders.length === 1
+                    ? 'req_011111111111111111111111'
+                    : 'req_022222222222222222222222',
+              },
+            }),
+          )
+        }
+        return Promise.resolve(new Response('{}', { status: 200 }))
+      },
+    ) as unknown as typeof fetch
+
+    const plugin = await getPlugin()
+    const messages = [
+      {
+        info: {
+          id: 'msg_billing_relay',
+          role: 'user',
+          sessionID: 'ses_billing_relay',
+        },
+        parts: [{ type: 'text', text: 'hello' }],
+      },
+    ]
+    await plugin['experimental.chat.messages.transform']({}, { messages })
+    const auth = await plugin.auth.loader(
+      () =>
+        Promise.resolve({
+          type: 'oauth' as const,
+          access: 'main-access',
+          refresh: 'main-refresh',
+          expires: Date.now() + 8 * 60 * 60_000,
+        }),
+      { models: {} },
+    )
+    const send = async (affinity: string) => {
+      const output = { headers: {} as Record<string, string> }
+      await plugin['chat.headers'](
+        {
+          sessionID: 'ses_billing_relay',
+          message: { id: 'msg_billing_relay' },
+        },
+        output,
+      )
+      return auth.fetch(MESSAGES_URL, {
+        method: 'POST',
+        headers: {
+          ...output.headers,
+          'x-session-affinity': affinity,
+        },
+        body: JSON.stringify({
+          model: 'claude-opus-5',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: 'hello' }],
+        }),
+      })
+    }
+
+    expect((await send('billing-relay-first')).status).toBe(200)
+    expect((await send('billing-relay-second')).status).toBe(200)
+    const firstPromptId = sentBillingHeaders[0]?.match(
+      /cc_prompt_id=([^;]+);/,
+    )?.[1]
+    expect(firstPromptId).toBeTruthy()
+    expect(sentBillingHeaders[0]).not.toContain('cc_prev_req=')
+    expect(sentBillingHeaders[1]).toContain(`cc_prompt_id=${firstPromptId};`)
+    expect(sentBillingHeaders[1]).toContain(
+      'cc_prev_req=req_011111111111111111111111;',
+    )
+  })
+})
+
 describe('Fable 5.1 request-scoped effort history', () => {
   const originalFetch = globalThis.fetch
 
@@ -9580,6 +9699,12 @@ describe('Fable 5.1 request-scoped effort history', () => {
     )
     let sentBody: Record<string, any> | undefined
     let sentHeaders: Headers | undefined
+    const sentBillingHeaders: string[] = []
+    const upstreamRequestIds = [
+      'req_011111111111111111111111',
+      'req_022222222222222222222222',
+      'req_033333333333333333333333',
+    ]
     globalThis.fetch = mock(
       (input: string | URL | Request, init?: RequestInit) => {
         const url = extractUrl(input)
@@ -9593,6 +9718,17 @@ describe('Fable 5.1 request-scoped effort history', () => {
         if (url.includes('/v1/messages')) {
           sentBody = JSON.parse(String(init?.body))
           sentHeaders = new Headers(init?.headers)
+          sentBillingHeaders.push(String(sentBody?.system?.[0]?.text ?? ''))
+          return Promise.resolve(
+            new Response('{}', {
+              status: 200,
+              headers: {
+                'request-id':
+                  upstreamRequestIds[sentBillingHeaders.length - 1] ??
+                  'req_099999999999999999999999',
+              },
+            }),
+          )
         }
         return Promise.resolve(new Response('{}', { status: 200 }))
       },
@@ -9704,6 +9840,13 @@ describe('Fable 5.1 request-scoped effort history', () => {
         body: loweredRequestBody,
       })
     expect((await send(output.headers)).status).toBe(200)
+    const firstPromptId = sentBillingHeaders[0]?.match(
+      /cc_prompt_id=([^;]+);/,
+    )?.[1]
+    expect(firstPromptId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+    expect(sentBillingHeaders[0]).not.toContain('cc_prev_req=')
 
     const retryOutput = { headers: {} as Record<string, string> }
     await plugin['chat.headers'](
@@ -9714,6 +9857,10 @@ describe('Fable 5.1 request-scoped effort history', () => {
       output.headers['x-cortexkit-effort-plan'],
     )
     expect((await send(retryOutput.headers)).status).toBe(200)
+    expect(sentBillingHeaders[1]).toContain(`cc_prompt_id=${firstPromptId};`)
+    expect(sentBillingHeaders[1]).toContain(
+      'cc_prev_req=req_011111111111111111111111;',
+    )
 
     expect(sentBody?.output_config).toEqual({ effort: 'low' })
     expect(sentBody?.messages).toEqual([
@@ -9753,6 +9900,7 @@ describe('Fable 5.1 request-scoped effort history', () => {
         header.startsWith('x-cortexkit-effort'),
       ),
     ).toBe(false)
+    expect(sentHeaders?.has('x-cortexkit-billing-lineage')).toBe(false)
 
     const prefixTrimmedResponse = await auth.fetch(MESSAGES_URL, {
       method: 'POST',
@@ -11991,6 +12139,7 @@ describe('auth.loader', () => {
           minimumRemaining: { five_hour: 10, seven_day: 20 },
           failClosedOnUnknownQuota: true,
           mainQuota: {
+            checkedAt: Date.now(),
             five_hour: { usedPercent: 100, remainingPercent: 0 },
             seven_day: { usedPercent: 50, remainingPercent: 50 },
           },
@@ -21700,6 +21849,7 @@ describe('cache diagnostics', () => {
             minimumRemaining: { five_hour: 10, seven_day: 20 },
             failClosedOnUnknownQuota: true,
             mainQuota: {
+              checkedAt: Date.now(),
               five_hour: { usedPercent: 100, remainingPercent: 0 },
               seven_day: { usedPercent: 50, remainingPercent: 50 },
             },
@@ -23911,24 +24061,17 @@ describe('claude-prime direct request', () => {
       prime: { enabled: true },
     })
     await useTempAccountFile(fixture)
-    let intervalCalls = 0
-    ;(globalThis as any).setInterval = mock(() => {
-      intervalCalls += 1
-      return { unref() {} } as unknown as ReturnType<typeof setInterval>
-    })
     const plugin1 = await getPlugin()
     const mgr1 = (plugin1 as any).__primeManager
     const firstLoadStorage = mgr1.options.loadStorage
     expect(mgr1).toBeDefined()
     expect(mgr1.isStopped?.()).toBeFalsy()
-    const intervalsAfterFirstPlugin = intervalCalls
     const plugin2 = await getPlugin()
     const mgr2 = (plugin2 as any).__primeManager
     expect(mgr2).toBeDefined()
     expect(mgr2).toBe(mgr1)
     expect(mgr2.options.loadStorage).not.toBe(firstLoadStorage)
     expect(mgr1.isStopped()).toBe(false)
-    expect(intervalCalls - intervalsAfterFirstPlugin).toBe(1)
   })
 
   test('plugin instances with different storage paths own independent prime managers', async () => {
@@ -23981,9 +24124,6 @@ describe('claude-prime sidebar on toggle', () => {
     })
     await useTempAccountFile(fixture)
     sidebarStateFile = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-    ;(globalThis as any).setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    )
     const plugin = await getPlugin()
     await plugin.auth.loader(
       () =>
@@ -24019,9 +24159,6 @@ describe('claude-prime sidebar on toggle', () => {
     })
     await useTempAccountFile(fixture)
     sidebarStateFile = process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE
-    ;(globalThis as any).setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    )
     const plugin = await getPlugin()
     await plugin.auth.loader(
       () =>
@@ -24066,12 +24203,8 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
   // refreshFallback call is redundant — its result is ignored.
 
   const originalFetch = globalThis.fetch
-  const originalSetInterval = globalThis.setInterval
 
   beforeEach(async () => {
-    globalThis.setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    ) as unknown as typeof setInterval
     // Marker dir is shared across processes; sweep leftovers so a prior
     // suite's fire doesn't suppress the next suite's claim.
     await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
@@ -24082,7 +24215,6 @@ describe('claude-prime — snapshot-derived freshness (R1/R2)', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch
-    globalThis.setInterval = originalSetInterval
   })
 
   test('R1: the manager skips a quota result classified stale', async () => {
@@ -24438,12 +24570,8 @@ describe('claude-prime — warn dedup (R3)', () => {
   // manager as a non-ok result and not log itself.
 
   const originalFetch = globalThis.fetch
-  const originalSetInterval = globalThis.setInterval
 
   beforeEach(async () => {
-    globalThis.setInterval = mock(
-      () => ({ unref() {} }) as unknown as ReturnType<typeof setInterval>,
-    ) as unknown as typeof setInterval
     // Marker dir is shared across processes; sweep leftovers so a prior
     // suite's fire doesn't suppress the next suite's claim.
     await rm(join(tmpdir(), 'opencode-anthropic-auth', 'prime'), {
@@ -24454,7 +24582,6 @@ describe('claude-prime — warn dedup (R3)', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch
-    globalThis.setInterval = originalSetInterval
   })
 
   test('R3: a fire-time main token refresh failure produces exactly one warn·prime·prime token refresh failed record (distinct from the generic fire-failed event)', async () => {

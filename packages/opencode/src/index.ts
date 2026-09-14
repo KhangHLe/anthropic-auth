@@ -202,7 +202,11 @@ import {
   writeCustodyHandleManifestEntry,
 } from '@cortexkit/anthropic-auth-core'
 import type { Plugin } from '@opencode-ai/plugin'
-
+import {
+  BILLING_LINEAGE_REQUEST_HEADER,
+  BillingLineageTracker,
+  extractAnthropicRequestId,
+} from './billing-lineage.ts'
 import {
   applyCacheDiagnosticsOptIn,
   buildCacheDiagnosticsRecord,
@@ -931,6 +935,7 @@ function zeroModelCosts<T extends Record<string, AnthropicProviderModel>>(
 type PluginRuntimeOverrides = Partial<{
   authorize: typeof authorize
   setTimeout: typeof globalThis.setTimeout
+  clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   claustrumConnector: ClaustrumConnector
@@ -990,6 +995,7 @@ const anthropicAuthPlugin = async (
 ) => {
   const runtimeTimers = {
     setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
     setInterval: globalThis.setInterval,
     clearInterval: globalThis.clearInterval,
     ...runtimeOverrides,
@@ -1069,6 +1075,7 @@ const anthropicAuthPlugin = async (
   const fableFallbackManager = new FableFallbackManager()
   const laneStartTracker = new LaneStartTracker()
   const effortPlanTracker = new OpenCodeEffortPlanTracker()
+  const billingLineageTracker = new BillingLineageTracker()
   const serverFallbackTargets = new Map<string, string>()
   const pendingDesktopNotices = new Map<string, string[]>()
   const pendingRecoveryDesktopNotices = new Map<string, string>()
@@ -3018,14 +3025,9 @@ const anthropicAuthPlugin = async (
           )
         }
       } else {
-        if (!latestGetAuth) return headers
-        const auth = await latestGetAuth()
-        if (auth.type !== 'oauth') return headers
-        if (!auth.access || (auth.expires && auth.expires < Date.now())) {
-          if (!latestRefreshMainAccessToken) return headers
-          auth.access = await latestRefreshMainAccessToken()
-        }
-        accessToken = auth.access
+        const credential = await getCurrentMainCredential()
+        accessToken = credential.accessToken
+        servedClaustrumCredential = credential.served
       }
       if (!accessToken) return headers
       try {
@@ -3161,9 +3163,6 @@ const anthropicAuthPlugin = async (
       storage,
     )
     await fallbackManager.save(storage, [accountId])
-    if (!refreshed.account.access) {
-      throw new Error(`prime: OAuth account ${accountId} has no access token`)
-    }
     return {
       quota: refreshed.account.quota ?? {},
       fresh: refreshed.fetched,
@@ -3347,6 +3346,10 @@ const anthropicAuthPlugin = async (
     sendPrime,
     recordSuccess: (accountId, usage) =>
       incrementPrimeUsagePersistent(accountId, usage, accountStoragePath),
+    setIntervalImpl: runtimeTimers.setInterval,
+    clearIntervalImpl: runtimeTimers.clearInterval,
+    setTimeoutImpl: runtimeTimers.setTimeout,
+    clearTimeoutImpl: runtimeTimers.clearTimeout,
   }
   const primeManager: PrimeManager = adoptPrimeManager(
     accountStoragePath,
@@ -5097,6 +5100,7 @@ const anthropicAuthPlugin = async (
       const messages = output.messages as Parameters<
         typeof markOpenCodeEffortTransitions
       >[0]
+      billingLineageTracker.observeMessages(messages)
       const plan = markOpenCodeEffortTransitions(messages)
       if (plan) {
         effortPlanTracker.record(plan)
@@ -5145,6 +5149,11 @@ const anthropicAuthPlugin = async (
         messageId: message.id,
         headers: output.headers,
       })
+      billingLineageTracker.markHeaders({
+        sessionId: sessionID,
+        messageId: message.id,
+        headers: output.headers,
+      })
     },
     event: async ({ event }: { event: unknown }) => {
       const value = event as unknown as {
@@ -5156,6 +5165,7 @@ const anthropicAuthPlugin = async (
             sessionID?: string
           }
           status?: { type?: string }
+          messageID?: string
         }
       }
       const info = value.properties?.info
@@ -5182,6 +5192,13 @@ const anthropicAuthPlugin = async (
           else break
         }
         scheduleDesktopNoticeProbe(sessionId)
+      }
+
+      if (
+        value.type === 'session.deleted' ||
+        value.type === 'message.removed'
+      ) {
+        billingLineageTracker.clearSession(sessionId)
       }
 
       if (value.type === 'session.deleted') {
@@ -6069,6 +6086,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
+            requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
             let body = await fetchBody(input, init)
             let streaming = false
             let dump: DumpHandle | null = null
@@ -6248,10 +6266,19 @@ const anthropicAuthPlugin = async (
               requestHeaders.get(EFFORT_PLAN_REQUEST_HEADER) ?? undefined
             const resolvedEffortPlan =
               effortPlanTracker.resolveHeader(effortPlanHeader)
+            const billingLineageHeader =
+              requestHeaders.get(BILLING_LINEAGE_REQUEST_HEADER) ?? undefined
+            const resolvedBillingLineage =
+              billingLineageTracker.resolveHeader(billingLineageHeader)
+            const activeBillingLineage =
+              !subagentRequest && !laneStartRequest
+                ? resolvedBillingLineage
+                : undefined
             requestHeaders.delete('x-parent-session-id')
             requestHeaders.delete('x-session-affinity')
             requestHeaders.delete('x-opencode-session')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
+            requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
             let body = init?.body
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
@@ -6350,6 +6377,7 @@ const anthropicAuthPlugin = async (
                   hybridStandbyAnchor: standbyCacheAnchor,
                   serverSideFallbackEnabled: fallbackMode === 'server',
                   laneStart: laneStartRequest,
+                  billingLineage: activeBillingLineage,
                   cacheDiagnosticsPreviousMessageId,
                   perf: (stage, data) => {
                     trace?.mark(`rewrite_body_${stage}`, { route, ...data })
@@ -6573,8 +6601,13 @@ const anthropicAuthPlugin = async (
               fallback: directFetch,
               affinity: relayAffinity,
               optimisticResponse: relayConfig?.transport === 'websocket',
-              onResponseHeaders: (headers) =>
-                harvestQuotaHeaders(headers, served),
+              onResponseHeaders: (headers) => {
+                harvestQuotaHeaders(headers, served)
+                billingLineageTracker.commit(
+                  activeBillingLineage,
+                  extractAnthropicRequestId(headers),
+                )
+              },
               onDumpCreated: (handle) => {
                 relayDump = handle
               },
@@ -6588,7 +6621,13 @@ const anthropicAuthPlugin = async (
               totalSendWithAccessMs: roundMs(nowMs() - start),
             })
 
-            if (usedDirectFetch) harvestQuotaHeaders(response.headers, served)
+            if (usedDirectFetch) {
+              harvestQuotaHeaders(response.headers, served)
+              billingLineageTracker.commit(
+                activeBillingLineage,
+                extractAnthropicRequestId(response.headers),
+              )
+            }
             attachCacheDiagnosticsResponse(response, {
               source: laneStartRequest ? 'start' : 'turn',
               accountId: oauthAccountId,

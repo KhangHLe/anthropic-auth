@@ -102,7 +102,7 @@ describe('cachekeep prewarm body', () => {
       system: [
         {
           type: 'text',
-          text: 'x-anthropic-billing-header: cc_version=2.1.177.3bf; cc_entrypoint=cli; cch=abcde;',
+          text: 'x-anthropic-billing-header: cc_version=2.1.177.3bf; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
         },
         { type: 'text', text: 'identity' },
         {
@@ -129,6 +129,8 @@ describe('cachekeep prewarm body', () => {
     })
     expect(result.bodyText).not.toContain('cch=abcde;')
     expect(result.bodyText).toMatch(/cch=[0-9a-f]{5};/)
+    expect(result.bodyText).not.toContain('cc_prev_req=')
+    expect(result.bodyText).not.toContain('cc_prompt_id=')
   })
 })
 

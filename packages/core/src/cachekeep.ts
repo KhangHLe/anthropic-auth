@@ -1,6 +1,6 @@
 import type { AccountStorage } from './accounts.ts'
 import type { CacheKeepTrackedSession } from './cachekeep-registry.ts'
-import { signRequestBody } from './cch.ts'
+import { signRequestBody, stripBillingLineageFromBody } from './cch.ts'
 import { orderClaudeCodeBody } from './claude-code.ts'
 import { dumpDirectRequest, dumpResponseArtifact } from './dump.ts'
 import { logger } from './logger.ts'
@@ -303,6 +303,7 @@ export async function buildCacheKeepPrewarmBody(
   }
 
   const warm = structuredClone(body) as Record<string, unknown>
+  stripBillingLineageFromBody(warm)
   warm.max_tokens = 0
   delete warm.stream
 

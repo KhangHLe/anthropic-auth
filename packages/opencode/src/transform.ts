@@ -4,6 +4,7 @@ import {
   applyClaudeCodeMetadata,
   applyThinkingBindingControls,
   assertNotCustodyTombstone,
+  type BillingLineageFields,
   buildBillingHeaderValue,
   type Cache1hMode,
   CLAUDE_CODE_ENTRYPOINT,
@@ -31,6 +32,7 @@ import {
   remapRequestBodyModel,
   selectClaudeCodeBetas,
   signRequestBody,
+  stripBillingLineageFromBody,
   TEXT_REPLACEMENTS,
   THINKING_BINDING_CONTROLS_BETA,
   type ThinkingPrefixMismatchBehavior,
@@ -1085,6 +1087,7 @@ export function prepareFableCacheWarmSource(
     // The prewarm must reach the source model (not be fallback-routed),
     // so strip any server-side fallback opt-in inherited from the captured body.
     delete body.fallbacks
+    stripBillingLineageFromBody(body)
     normalizeFableMythosRequest(body)
     normalizeOpus5Request(body)
     return { ok: true, bodyText: JSON.stringify(body) }
@@ -1265,6 +1268,7 @@ export async function rewriteRequestBody(
     serverSideFallbackEnabled?: boolean
     modelRemapEnabled?: boolean
     laneStart?: boolean
+    billingLineage?: BillingLineageFields
     cacheDiagnosticsPreviousMessageId?: string | null
   } = {},
 ): Promise<string> {
@@ -1358,6 +1362,7 @@ export async function rewriteRequestBody(
                   options.laneStart === true,
                 )
               : undefined,
+            options.billingLineage,
           )
         : null
     options.perf?.('billing_header', {

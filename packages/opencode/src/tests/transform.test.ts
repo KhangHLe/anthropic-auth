@@ -206,6 +206,32 @@ describe('conversation-start billing suffix pinning', () => {
     )
   })
 
+  test('adds request lineage to the signed billing header', async () => {
+    const rewritten = JSON.parse(
+      await rewriteRequestBody(
+        JSON.stringify({
+          model: 'claude-fable-5-1',
+          messages: [{ role: 'user', content: 'hello' }],
+          system: [],
+        }),
+        {
+          billingLineage: {
+            previousRequestId: 'req_011111111111111111111111',
+            promptId: '00000000-0000-4000-8000-000000000001',
+          },
+        },
+      ),
+    )
+
+    expect(rewritten.system[0].text).toMatch(/cch=[0-9a-f]{5};/)
+    expect(rewritten.system[0].text).toContain(
+      'cc_prev_req=req_011111111111111111111111;',
+    )
+    expect(rewritten.system[0].text).toContain(
+      'cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+    )
+  })
+
   test('tracks changing first-user text without a session pin', async () => {
     const first = JSON.parse(await rewriteForSession('messCage'))
     const changed = JSON.parse(await rewriteForSession('messDage'))
@@ -2168,6 +2194,10 @@ describe('prepareFableCacheWarmSource', () => {
         system: [
           {
             type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1.258.123; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+          },
+          {
+            type: 'text',
             text: 'stable',
             cache_control: { type: 'ephemeral', ttl: '1h' },
           },
@@ -2184,6 +2214,8 @@ describe('prepareFableCacheWarmSource', () => {
     expect(body.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
     expect(body.output_config).toEqual({ effort: 'xhigh' })
     expect(body.messages).toEqual([{ role: 'user', content: 'same input' }])
+    expect(source.bodyText).not.toContain('cc_prev_req=')
+    expect(source.bodyText).not.toContain('cc_prompt_id=')
   })
 
   test('restores an Opus 5 request to claude-opus-5 when explicitly requested', () => {
@@ -2222,6 +2254,27 @@ describe('prepareFableCacheWarmSource', () => {
     expect(body.speed).toBeUndefined()
     expect(selectClaudeCodeBetas(body).split(',')).not.toContain(
       'server-side-fallback-2026-07-01',
+    )
+  })
+
+  test('strips request lineage before reusing a source-cache body', () => {
+    const source = prepareFableCacheWarmSource(
+      JSON.stringify({
+        model: 'claude-opus-4-8',
+        system: [
+          {
+            type: 'text',
+            text: 'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde; cc_prev_req=req_011111111111111111111111; cc_prompt_id=00000000-0000-4000-8000-000000000001;',
+          },
+        ],
+        messages: [{ role: 'user', content: 'same input' }],
+      }),
+    )
+
+    expect(source.ok).toBe(true)
+    if (!source.ok) throw new Error(source.reason)
+    expect(JSON.parse(source.bodyText).system[0].text).toBe(
+      'x-anthropic-billing-header: cc_version=2.1.258.ef1; cc_entrypoint=cli; cch=abcde;',
     )
   })
 

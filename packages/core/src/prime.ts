@@ -537,10 +537,18 @@ export type PrimeManagerOptions = {
   now?: () => number
   markerDir?: string
   storagePath: string
+  setIntervalImpl?: typeof globalThis.setInterval
+  clearIntervalImpl?: typeof globalThis.clearInterval
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  clearTimeoutImpl?: typeof globalThis.clearTimeout
 }
 
 export class PrimeManager {
   private timer: ReturnType<typeof setInterval> | null = null
+  private readonly setIntervalImpl: typeof globalThis.setInterval
+  private readonly clearIntervalImpl: typeof globalThis.clearInterval
+  private readonly setTimeoutImpl: typeof globalThis.setTimeout
+  private readonly clearTimeoutImpl: typeof globalThis.clearTimeout
   private postFireRefreshTimers = new Set<ReturnType<typeof setTimeout>>()
   private lastForcedCheck = new Map<
     string,
@@ -575,6 +583,11 @@ export class PrimeManager {
 
   constructor(options: PrimeManagerOptions) {
     this.options = options
+    this.setIntervalImpl = options.setIntervalImpl ?? globalThis.setInterval
+    this.clearIntervalImpl =
+      options.clearIntervalImpl ?? globalThis.clearInterval
+    this.setTimeoutImpl = options.setTimeoutImpl ?? globalThis.setTimeout
+    this.clearTimeoutImpl = options.clearTimeoutImpl ?? globalThis.clearTimeout
   }
 
   updateOptions(options: PrimeManagerOptions): void {
@@ -585,7 +598,7 @@ export class PrimeManager {
     if (this.timer) return
     this.stopped = false
     logger.trace('prime', 'manager started')
-    this.timer = setInterval(() => {
+    this.timer = this.setIntervalImpl(() => {
       void this.tick().catch((error) => {
         logger.warn('prime', 'tick failed', {
           error: error instanceof Error ? error.message : String(error),
@@ -602,10 +615,12 @@ export class PrimeManager {
     const hadPostFireRefresh = this.postFireRefreshTimers.size > 0
     this.stopped = true
     if (this.timer) {
-      clearInterval(this.timer)
+      this.clearIntervalImpl(this.timer)
       this.timer = null
     }
-    for (const timer of this.postFireRefreshTimers) clearTimeout(timer)
+    for (const timer of this.postFireRefreshTimers) {
+      this.clearTimeoutImpl(timer)
+    }
     this.postFireRefreshTimers.clear()
     this.lastForcedCheck.clear()
     if (!hadTimer && !hadPostFireRefresh) return
@@ -1018,7 +1033,7 @@ export class PrimeManager {
     // Unified fire-response headers can arm the window instantly on newer
     // trees. This branch predates header harvesting, so a delayed poll captures
     // the reset after the usage API's observed propagation lag.
-    const timer = setTimeout(() => {
+    const timer = this.setTimeoutImpl(() => {
       this.postFireRefreshTimers.delete(timer)
       if (this.stopped) return
       void (async () => {

@@ -648,6 +648,9 @@ export type CustodyManifestLockTestOptions = Partial<{
   retryMinMs: number
   retryMaxMs: number
   renewalIntervalMs: number
+  now: () => number
+  setIntervalImpl: typeof globalThis.setInterval
+  clearIntervalImpl: typeof globalThis.clearInterval
   afterStaleOwnerRead: () => void | Promise<void>
   beforeRename: () => void | Promise<void>
 }>
@@ -753,7 +756,12 @@ export async function withCustodyManifestLock<T>(
   fn: (assertLease: () => Promise<void>, nonce: string) => Promise<T>,
 ): Promise<T> {
   const lockPath = `${path}.lock`
-  const now = Date.now
+  const now = custodyManifestLockTestOptions?.now ?? Date.now
+  const setIntervalImpl =
+    custodyManifestLockTestOptions?.setIntervalImpl ?? globalThis.setInterval
+  const clearIntervalImpl =
+    custodyManifestLockTestOptions?.clearIntervalImpl ??
+    globalThis.clearInterval
   const ttlMs =
     custodyManifestLockTestOptions?.ttlMs ?? CUSTODY_MANIFEST_LOCK_TTL_MS
   const retryMinMs =
@@ -889,7 +897,7 @@ export async function withCustodyManifestLock<T>(
         'manifest lock renewal failed; write aborted',
       )
   }
-  const renewal = setInterval(
+  const renewal = setIntervalImpl(
     () => {
       renewalInFlight = writeOwner(now()).catch(() => {
         renewalFailed = true
@@ -902,7 +910,7 @@ export async function withCustodyManifestLock<T>(
   try {
     return await fn(assertLease, nonce)
   } finally {
-    clearInterval(renewal)
+    clearIntervalImpl(renewal)
     if (!(await ownsCurrentLease())) {
       logger.warn('claustrum', 'manifest lock lease lost, not releasing', {
         id: path,

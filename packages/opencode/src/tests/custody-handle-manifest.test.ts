@@ -1474,19 +1474,18 @@ describe('withCustodyManifestLock', () => {
     async () => {
       await withTempDirectory(async (directory) => {
         const path = join(directory, 'handles.json')
-        const originalNow = Date.now
-        const originalSetInterval = globalThis.setInterval
-        const originalClearInterval = globalThis.clearInterval
         let now = 0
         let renew: (() => void) | undefined
-        Date.now = () => now
-        globalThis.setInterval = ((handler: () => void) => {
+        const setIntervalImpl = ((handler: () => void) => {
           renew = handler
           return {} as ReturnType<typeof setInterval>
         }) as typeof setInterval
-        globalThis.clearInterval = (() => {}) as typeof clearInterval
+        const clearIntervalImpl = (() => {}) as typeof clearInterval
         __setCustodyManifestLockTestOptions({
           ttlMs: 100,
+          now: () => now,
+          setIntervalImpl,
+          clearIntervalImpl,
           retryMinMs: 5,
           retryMaxMs: 5,
           renewalIntervalMs: 30,
@@ -1517,9 +1516,7 @@ describe('withCustodyManifestLock', () => {
           await Promise.all([first, second])
           expect(order).toEqual(['first-enter', 'first-exit', 'second-enter'])
         } finally {
-          Date.now = originalNow
-          globalThis.setInterval = originalSetInterval
-          globalThis.clearInterval = originalClearInterval
+          __setCustodyManifestLockTestOptions()
         }
       })
     },

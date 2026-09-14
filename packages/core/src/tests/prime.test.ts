@@ -372,6 +372,8 @@ async function makeHarness(opts: {
   recordSuccessReturn?: PrimeUsageCounters
   refreshError?: Error
   storagePath?: string
+  setTimeoutImpl?: typeof globalThis.setTimeout
+  clearTimeoutImpl?: typeof globalThis.clearTimeout
 }): Promise<Harness> {
   const sendCalls: SendCall[] = []
   const refreshCalls: string[] = []
@@ -415,6 +417,8 @@ async function makeHarness(opts: {
     },
     now: () => opts.now,
     markerDir: opts.markerDir,
+    setTimeoutImpl: opts.setTimeoutImpl,
+    clearTimeoutImpl: opts.clearTimeoutImpl,
   })
 
   return {
@@ -1641,16 +1645,14 @@ describe('PrimeManager — recordSuccess', () => {
       },
     })
     const now = 500 + 120_000
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     let scheduled: (() => void) | undefined
     let scheduledDelay: number | undefined
-    globalThis.setTimeout = ((handler: () => void, delay?: number) => {
+    const setTimeoutImpl = ((handler: () => void, delay?: number) => {
       scheduled = handler
       scheduledDelay = delay
       return 42
     }) as typeof setTimeout
-    globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+    const clearTimeoutImpl = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1663,22 +1665,19 @@ describe('PrimeManager — recordSuccess', () => {
           checkedAt: 2,
         },
       },
+      setTimeoutImpl,
+      clearTimeoutImpl,
     })
 
-    try {
-      await h.manager.tick()
-      expect(h.refreshCalls).toEqual(['main'])
-      expect(scheduledDelay).toBe(PRIME_POST_FIRE_REFRESH_MS)
+    await h.manager.tick()
+    expect(h.refreshCalls).toEqual(['main'])
+    expect(scheduledDelay).toBe(PRIME_POST_FIRE_REFRESH_MS)
 
-      scheduled?.()
-      await Promise.resolve()
+    scheduled?.()
+    await Promise.resolve()
 
-      expect(h.refreshCalls).toEqual(['main', 'main'])
-      await h.cleanup()
-    } finally {
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
-    }
+    expect(h.refreshCalls).toEqual(['main', 'main'])
+    await h.cleanup()
   })
 
   test('post-fire refresh skips when another process disables prime', async () => {
@@ -1693,14 +1692,12 @@ describe('PrimeManager — recordSuccess', () => {
       },
     })
     const now = 500 + 120_000
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     let scheduled: (() => void) | undefined
-    globalThis.setTimeout = ((handler: () => void) => {
+    const setTimeoutImpl = ((handler: () => void) => {
       scheduled = handler
       return 42
     }) as typeof setTimeout
-    globalThis.clearTimeout = (() => {}) as typeof clearTimeout
+    const clearTimeoutImpl = (() => {}) as typeof clearTimeout
     const h = await makeHarness({
       storage: fixture.storage,
       markerDir: markerRoot,
@@ -1713,23 +1710,20 @@ describe('PrimeManager — recordSuccess', () => {
           checkedAt: 2,
         },
       },
+      setTimeoutImpl,
+      clearTimeoutImpl,
     })
 
-    try {
-      await h.manager.tick()
-      expect(h.refreshCalls).toEqual(['main'])
-      fixture.storage.prime = { enabled: false }
+    await h.manager.tick()
+    expect(h.refreshCalls).toEqual(['main'])
+    fixture.storage.prime = { enabled: false }
 
-      scheduled?.()
-      await Promise.resolve()
-      await Promise.resolve()
+    scheduled?.()
+    await Promise.resolve()
+    await Promise.resolve()
 
-      expect(h.refreshCalls).toEqual(['main'])
-      await h.cleanup()
-    } finally {
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
-    }
+    expect(h.refreshCalls).toEqual(['main'])
+    await h.cleanup()
   })
 })
 
@@ -1859,15 +1853,13 @@ describe('PrimeManager — lifecycle', () => {
       },
     })
     const now = 500 + 120_000
-    const originalSetTimeout = globalThis.setTimeout
-    const originalClearTimeout = globalThis.clearTimeout
     let scheduled: (() => void) | undefined
     const cleared: unknown[] = []
-    globalThis.setTimeout = ((handler: () => void) => {
+    const setTimeoutImpl = ((handler: () => void) => {
       scheduled = handler
       return 42
     }) as typeof setTimeout
-    globalThis.clearTimeout = ((timer: unknown) => {
+    const clearTimeoutImpl = ((timer: unknown) => {
       cleared.push(timer)
     }) as typeof clearTimeout
     const h = await makeHarness({
@@ -1882,21 +1874,18 @@ describe('PrimeManager — lifecycle', () => {
           checkedAt: 2,
         },
       },
+      setTimeoutImpl,
+      clearTimeoutImpl,
     })
 
-    try {
-      await h.manager.tick()
-      h.manager.stop()
-      scheduled?.()
-      await Promise.resolve()
+    await h.manager.tick()
+    h.manager.stop()
+    scheduled?.()
+    await Promise.resolve()
 
-      expect(cleared).toEqual([42])
-      expect(h.refreshCalls).toEqual(['main'])
-    } finally {
-      await h.cleanup()
-      globalThis.setTimeout = originalSetTimeout
-      globalThis.clearTimeout = originalClearTimeout
-    }
+    expect(cleared).toEqual([42])
+    expect(h.refreshCalls).toEqual(['main'])
+    await h.cleanup()
   })
 })
 

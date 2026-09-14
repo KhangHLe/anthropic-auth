@@ -2437,6 +2437,63 @@ describe('account storage', () => {
     ).toBe(80)
   })
 
+  test('main quota ordering ignores the legacy standalone timestamp', async () => {
+    const storage = baseStorage()
+    storage.quota = {
+      ...storage.quota,
+      mainQuota: {
+        five_hour: {
+          usedPercent: 20,
+          remainingPercent: 80,
+          checkedAt: 500,
+        },
+        source: 'poll',
+        checkedAt: 500,
+      },
+      mainQuotaCheckedAt: 1,
+      mainQuotaToken: 'same-token',
+    }
+    await saveAccounts(storage)
+
+    const stale = await loadAccounts()
+    expect(stale).not.toBeNull()
+    ;(stale as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 90,
+        remainingPercent: 10,
+        checkedAt: 100,
+      },
+      source: 'poll',
+      checkedAt: 100,
+    }
+    ;(stale as AccountStorage).quota!.mainQuotaCheckedAt = 10_000
+    await saveAccountState(stale as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+    expect(
+      (await loadAccounts())?.quota?.mainQuota?.five_hour?.usedPercent,
+    ).toBe(20)
+
+    const fresh = await loadAccounts()
+    expect(fresh).not.toBeNull()
+    ;(fresh as AccountStorage).quota!.mainQuota = {
+      five_hour: {
+        usedPercent: 30,
+        remainingPercent: 70,
+        checkedAt: 600,
+      },
+      source: 'poll',
+      checkedAt: 600,
+    }
+    ;(fresh as AccountStorage).quota!.mainQuotaCheckedAt = 0
+    await saveAccountState(fresh as AccountStorage, accountPath, {
+      mainQuota: true,
+    })
+    expect(
+      (await loadAccounts())?.quota?.mainQuota?.five_hour?.usedPercent,
+    ).toBe(30)
+  })
+
   test('main equal-time poll beats headers and source-less saves', async () => {
     const storage = baseStorage()
     storage.quota = {

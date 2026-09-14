@@ -41,14 +41,14 @@ This repo is a Bun workspace monorepo with two user-facing integrations and one 
 - **Quota sidebar widget**: register the OpenCode TUI plugin in `tui.json` to render a live sidebar with per-account quota, routing, cache, and health state.
 - **Killswitch**: per-account hard-block thresholds that stop requests before hitting Anthropic's rate limits, with synthetic 429 retry-after when all accounts are exhausted.
 - **User-owned Cloudflare relay**: optionally provision your own Worker relay to reduce repeated client upload bytes for large OpenCode or Pi requests.
-- **Claude-compatible request hardening**: Claude Code 2.1.258 identity and final-body billing signing, live-session-stable billing suffixes, Fable 5.1 thinking-prefix recovery, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
+- **Claude-compatible request hardening**: Claude Code 2.1.258 identity and final-body billing signing, user-turn prompt and request lineage across OpenCode tool loops, live-session-stable billing suffixes, Fable 5.1 thinking-prefix recovery, safer token refresh persistence, replay-safe fallback retries, and subagent cache isolation.
 
 ## What these integrations do
 
 - Let OpenCode and Pi use Claude Pro/Max OAuth credentials instead of an Anthropic API key.
 - In OpenCode, intercept the final Anthropic request and rewrite it into the Claude-compatible shape expected by Anthropic OAuth access.
 - In Pi, replace Pi's built-in Anthropic provider with a CortexKit provider override that uses the same Claude-compatible request path.
-- Add Claude billing headers with stable `cc_version` and body-derived `cch` signing.
+- Add Claude billing headers with stable `cc_version`, OpenCode user-turn `cc_prompt_id`/`cc_prev_req` lineage, and body-derived `cch` signing.
 - Support fallback Claude accounts stored in a local per-agent sidecar file.
 - Keep fallback OAuth tokens fresh in the background.
 - Apply quota thresholds before routing to main or fallback accounts.
