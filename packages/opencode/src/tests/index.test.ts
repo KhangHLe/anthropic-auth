@@ -679,6 +679,7 @@ function fireConcurrentFetches(result: { fetch: typeof fetch }) {
 type PluginRuntimeOverrides = Partial<{
   authorize: typeof import('@cortexkit/anthropic-auth-core').authorize
   setTimeout: typeof globalThis.setTimeout
+  clearTimeout: typeof globalThis.clearTimeout
   setInterval: typeof globalThis.setInterval
   clearInterval: typeof globalThis.clearInterval
   claustrumConnector: (options: unknown) => Promise<unknown>
@@ -1474,23 +1475,55 @@ describe('fallback Claustrum credential resolution', () => {
         releaseCredential = () =>
           resolve(credentialResponse('late-main-access', 1))
       })
+      let releaseWarmupTimeout!: () => void
+      const warmupTimeoutScheduled = new Promise<void>((resolve) => {
+        releaseWarmupTimeout = resolve
+      })
+      let fireWarmupTimeout: (() => void) | undefined
+      const warmupTimer = {
+        unref() {},
+      } as unknown as ReturnType<typeof setTimeout>
+      const clearTimeoutImpl = mock(
+        (timer: ReturnType<typeof setTimeout> | undefined) => {
+          if (timer !== warmupTimer) globalThis.clearTimeout(timer)
+        },
+      )
+      let captureWarmupTimer = true
       const plugin = await getPlugin(undefined, undefined, {
         claustrumConnector: connectorFor([], (method) =>
           method === 'credential.get' ? credential : { result: {} },
         ),
+        setTimeout: mock((handler: TestTimerHandler, delay?: number) => {
+          if (captureWarmupTimer && delay === 100) {
+            captureWarmupTimer = false
+            fireWarmupTimeout = () => {
+              if (typeof handler === 'function') handler()
+            }
+            releaseWarmupTimeout()
+            return warmupTimer
+          }
+          return globalThis.setTimeout(handler, delay)
+        }) as unknown as typeof setTimeout,
+        clearTimeout: clearTimeoutImpl as unknown as typeof clearTimeout,
       })
 
       try {
-        const startedAt = performance.now()
-        const result = (await withDeadlockGuard(
-          plugin.auth.loader(
+        let loaderResolved = false
+        const loaderPromise = plugin.auth
+          .loader(
             () => Promise.resolve(custodyTombstoneOAuth('anthropic') as never),
             { models: {} },
-          ),
-          150,
-          'tombstoned main loader exceeded 150ms',
-        )) as { fetch: typeof fetch }
-        expect(performance.now() - startedAt).toBeLessThan(150)
+          )
+          .then((result: unknown) => {
+            loaderResolved = true
+            return result
+          })
+        await warmupTimeoutScheduled
+        expect(loaderResolved).toBeFalse()
+        expect(fireWarmupTimeout).toBeDefined()
+        fireWarmupTimeout?.()
+        const result = (await loaderPromise) as { fetch: typeof fetch }
+        expect(clearTimeoutImpl).toHaveBeenCalledWith(warmupTimer)
         await expect(
           result.fetch(MESSAGES_URL, EMPTY_POST),
         ).rejects.toMatchObject({

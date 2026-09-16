@@ -2460,7 +2460,7 @@ const anthropicAuthPlugin = async (
     const timeout = new Promise<undefined>((resolve) => {
       resolveTimeout = () => resolve(undefined)
     })
-    const timer = globalThis.setTimeout(
+    const timer = runtimeTimers.setTimeout(
       resolveTimeout,
       CLAUSTRUM_WARMUP_TIMEOUT_MS,
     )
@@ -2468,7 +2468,7 @@ const anthropicAuthPlugin = async (
     try {
       return await Promise.race([cache.get(handle, minTtlMs), timeout])
     } finally {
-      globalThis.clearTimeout(timer)
+      runtimeTimers.clearTimeout(timer)
     }
   }
 
