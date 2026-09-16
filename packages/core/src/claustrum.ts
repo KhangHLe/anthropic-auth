@@ -294,6 +294,27 @@ function isValidCustodyCredentialId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
 
+// The manifest is a co-tenant file: a sibling plugin (`provider: 'openai'`,
+// `serve: 'openai-auth'`) writes its own block in the same file. Provider
+// scoping is what stops us from binding its handles — the parser has to
+// enforce it because the sibling plugin never talks to us.
+//
+// Scope on the SECOND colon-separated segment (the provider segment). The
+// first segment is a "kind" prefix the vault owner extends (`oauth:`,
+// `chatgpt:`, `antigravity:`, `apikey:`, …) and the rule deliberately does
+// NOT enumerate or constrain it: enumerating the kinds would reject live
+// credentials the moment a new one ships. The third-and-later segments are
+// the label, which is never consulted here — the label is the lookup key
+// elsewhere, not an authorization check.
+function isScopedCustodyCredentialId(
+  value: unknown,
+  provider: string,
+): value is string {
+  if (typeof value !== 'string' || value.length === 0) return false
+  const segments = value.split(':')
+  return segments[1] === provider
+}
+
 function legacyOrUnresolved(
   account: OAuthAccount,
   reason: Extract<CustodyHandleResolution, { status: 'unresolved' }>['reason'],
@@ -426,7 +447,7 @@ export function readCustodyHandles(
       !Object.hasOwn(entry, 'credential_id') ||
       typeof entry.handle !== 'string' ||
       !isValidCustodyHandle(entry.handle) ||
-      !isValidCustodyCredentialId(entry.credential_id)
+      !isScopedCustodyCredentialId(entry.credential_id, provider)
     ) {
       corruptLabels.add(entry.label)
       continue
