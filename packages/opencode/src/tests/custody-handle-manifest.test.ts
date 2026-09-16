@@ -446,7 +446,7 @@ describe('writeCustodyHandleManifestEntry', () => {
     })
   })
 
-  test('accepts a non-canonical credential id via the writer', async () => {
+  test('accepts an in-provider non-canonical credential id via the writer', async () => {
     await withTempDirectory(async (directory) => {
       const parent = join(directory, 'manifest')
       const path = join(parent, 'handles.json')
@@ -469,6 +469,23 @@ describe('writeCustodyHandleManifestEntry', () => {
           credential_id: 'oauth:anthropic',
         },
       ])
+    })
+  })
+
+  test('refuses a credential id scoped to another provider', async () => {
+    await withTempDirectory(async (directory) => {
+      const parent = join(directory, 'manifest')
+      const path = join(parent, 'handles.json')
+      await fs.mkdir(parent)
+      await fs.chmod(parent, 0o700)
+
+      await expect(
+        writeCustodyHandleManifestEntry({
+          path,
+          entry: { ...writerEntry, credentialId: 'chatgpt:openai' },
+        }),
+      ).resolves.toEqual({ status: 'refused', reason: 'invalid entry' })
+      await expect(fs.lstat(path)).rejects.toMatchObject({ code: 'ENOENT' })
     })
   })
 

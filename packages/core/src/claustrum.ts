@@ -1019,7 +1019,7 @@ export async function writeCustodyHandleManifestEntry(
   if (
     !isValidCustodyLabel(input.entry.label) ||
     !isValidCustodyHandle(input.entry.handle) ||
-    !isValidCustodyCredentialId(input.entry.credentialId)
+    !isScopedCustodyCredentialId(input.entry.credentialId, 'anthropic')
   ) {
     return refusal('invalid entry')
   }
