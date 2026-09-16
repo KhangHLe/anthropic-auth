@@ -626,6 +626,7 @@ async function sendIgnoredMessage(
     noReply?: boolean
     beforeActiveAssistant?: boolean
     canSend?: () => boolean
+    onPreparedMessageId?: (messageId: string) => void
   } = {},
 ): Promise<boolean> {
   const session = ctx.client.session as PluginSessionClient | undefined
@@ -654,6 +655,9 @@ async function sendIgnoredMessage(
   // A new user prompt can start while that request is in flight, so re-check the
   // caller's delivery lease immediately before inserting the ignored message.
   if (options.canSend && !options.canSend()) return false
+  if (request.body.messageID) {
+    options.onPreparedMessageId?.(request.body.messageID)
+  }
 
   if (typeof session?.promptAsync === 'function') {
     await session.promptAsync(request)
@@ -1088,6 +1092,7 @@ const anthropicAuthPlugin = async (
   const desktopNoticeSafeSessions = new Set<string>()
   const desktopNoticeLatestUserMessages = new Map<string, string>()
   const desktopNoticeIdleUserMessages = new Map<string, string>()
+  const desktopNoticeMessageIds = new Map<string, Set<string>>()
   const desktopNoticeProbes = new Map<string, number>()
   const stickySessionRouter = new StickySessionRouter({
     path:
@@ -4053,6 +4058,26 @@ const anthropicAuthPlugin = async (
     if (desktopText) queueDesktopNotice(notice.sessionId, desktopText)
   }
 
+  function trackDesktopNoticeMessageId(sessionId: string, messageId: string) {
+    const messageIds =
+      desktopNoticeMessageIds.get(sessionId) ?? new Set<string>()
+    messageIds.delete(messageId)
+    messageIds.add(messageId)
+    while (messageIds.size > 4) {
+      const oldest = messageIds.values().next().value
+      if (typeof oldest !== 'string') break
+      messageIds.delete(oldest)
+    }
+    desktopNoticeMessageIds.set(sessionId, messageIds)
+  }
+
+  function isDesktopNoticeMessage(sessionId: string, messageId?: string) {
+    return (
+      typeof messageId === 'string' &&
+      desktopNoticeMessageIds.get(sessionId)?.has(messageId) === true
+    )
+  }
+
   function queueDesktopNotice(sessionId: string, text: string) {
     if (isTuiConnected(sessionId)) return
     // OpenCode's prompt endpoints run revert cleanup before honoring noReply.
@@ -4161,13 +4186,26 @@ const anthropicAuthPlugin = async (
           return
         }
         try {
+          const isCurrentNotice = () =>
+            pendingDesktopNotices.get(sessionId) === queue && queue[0] === text
           const sent = await sendIgnoredMessage(ctx, sessionId, text, {
             noReply: true,
             beforeActiveAssistant: true,
-            canSend: () => desktopNoticeSafeSessions.has(sessionId),
+            canSend: () =>
+              desktopNoticeSafeSessions.has(sessionId) && isCurrentNotice(),
+            onPreparedMessageId: (messageId) =>
+              trackDesktopNoticeMessageId(sessionId, messageId),
           })
-          if (!sent) return
-          queue.shift()
+          if (!sent) {
+            if (
+              desktopNoticeSafeSessions.has(sessionId) &&
+              !isCurrentNotice()
+            ) {
+              continue
+            }
+            return
+          }
+          if (isCurrentNotice()) queue.shift()
         } catch (error) {
           logger.warn('fable-fallback', 'Desktop notification failed', {
             session: sessionId,
@@ -5250,7 +5288,11 @@ const anthropicAuthPlugin = async (
         value.properties?.sessionID ?? info?.sessionID ?? info?.id
       if (!sessionId) return
 
-      if (value.type === 'message.updated' && info?.role === 'user') {
+      if (
+        value.type === 'message.updated' &&
+        info?.role === 'user' &&
+        !isDesktopNoticeMessage(sessionId, info.id)
+      ) {
         if (typeof info.id === 'string') {
           desktopNoticeLatestUserMessages.set(sessionId, info.id)
           if (
@@ -5311,6 +5353,7 @@ const anthropicAuthPlugin = async (
         desktopNoticeSafeSessions.delete(sessionId)
         desktopNoticeLatestUserMessages.delete(sessionId)
         desktopNoticeIdleUserMessages.delete(sessionId)
+        desktopNoticeMessageIds.delete(sessionId)
         for (const recoveryKey of pendingRecoveryDesktopNotices.keys()) {
           if (recoveryKey.startsWith(`${sessionId}\0`)) {
             pendingRecoveryDesktopNotices.delete(recoveryKey)
