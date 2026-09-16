@@ -273,6 +273,23 @@ export function custodyCredentialId(label: string): string {
   return `${CUSTODY_CREDENTIAL_PREFIX}${label}`
 }
 
+// A resolved MANIFEST binding carries the credential id verbatim (the parser
+// stores it as-written and the resolver returns it; round 2 dropped the
+// parse-time derivation check). Anything else — legacy source, unresolved,
+// or a manifest entry whose id happens to be undefined — derives from the
+// label, the only id the caller can construct without a binding in hand.
+// Callers building completion records (local-exit, reachability probe)
+// pass this single rule instead of inlining it.
+export function custodyCredentialIdFromResolution(
+  resolution: CustodyHandleResolution,
+  label: string,
+): string {
+  if (resolution.status === 'resolved' && resolution.source === 'manifest') {
+    return resolution.credentialId ?? custodyCredentialId(label)
+  }
+  return custodyCredentialId(label)
+}
+
 function isValidCustodyCredentialId(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }
@@ -321,10 +338,10 @@ export function resolveCustodyHandle(input: {
     return { status: 'unresolved', reason: 'corrupt-binding' }
   }
 
+  // The manifest carries the credential id verbatim; the runtime fence in
+  // custody-mode.ts is the one that compares it against vault ground truth.
   const entry = manifest.accounts.find(
-    (candidate) =>
-      candidate.label === account.label &&
-      candidate.credentialId === custodyCredentialId(account.label),
+    (candidate) => candidate.label === account.label,
   )
   if (!entry) return legacyOrUnresolved(account, 'missing-entry')
   if (manifest.superseded.has(entry.handle)) {
@@ -372,6 +389,27 @@ export function readCustodyHandles(
   if (!Object.hasOwn(source, 'accounts') || !Array.isArray(source.accounts)) {
     throw new Error('invalid manifest accounts')
   }
+  // The label is the sole lookup key; two entries with the same label cannot
+  // tell the resolver which one to bind, so every such entry is marked corrupt
+  // rather than silently picking a winner.
+  const labelCounts = new Map<string, number>()
+  for (const candidate of source.accounts) {
+    if (
+      !isRecord(candidate) ||
+      !Object.hasOwn(candidate, 'label') ||
+      typeof candidate.label !== 'string' ||
+      !isValidCustodyLabel(candidate.label)
+    )
+      continue
+    labelCounts.set(
+      candidate.label,
+      (labelCounts.get(candidate.label) ?? 0) + 1,
+    )
+  }
+  const duplicateLabels = new Set(
+    [...labelCounts].filter(([, count]) => count > 1).map(([label]) => label),
+  )
+
   const superseded = new Set<string>()
   const corruptLabels = new Set<string>()
   const accounts: CustodyHandleAccount[] = []
@@ -388,10 +426,12 @@ export function readCustodyHandles(
       !Object.hasOwn(entry, 'credential_id') ||
       typeof entry.handle !== 'string' ||
       !isValidCustodyHandle(entry.handle) ||
-      !isValidCustodyCredentialId(entry.credential_id) ||
-      (provider === 'anthropic' &&
-        entry.credential_id !== custodyCredentialId(entry.label))
+      !isValidCustodyCredentialId(entry.credential_id)
     ) {
+      corruptLabels.add(entry.label)
+      continue
+    }
+    if (duplicateLabels.has(entry.label)) {
       corruptLabels.add(entry.label)
       continue
     }
@@ -958,8 +998,7 @@ export async function writeCustodyHandleManifestEntry(
   if (
     !isValidCustodyLabel(input.entry.label) ||
     !isValidCustodyHandle(input.entry.handle) ||
-    !isValidCustodyCredentialId(input.entry.credentialId) ||
-    input.entry.credentialId !== custodyCredentialId(input.entry.label)
+    !isValidCustodyCredentialId(input.entry.credentialId)
   ) {
     return refusal('invalid entry')
   }
@@ -987,8 +1026,7 @@ export async function removeCustodyHandleManifestEntry(
   if (
     !isValidCustodyLabel(input.entry.label) ||
     !isValidCustodyHandle(input.entry.handle) ||
-    !isValidCustodyCredentialId(input.entry.credentialId) ||
-    input.entry.credentialId !== custodyCredentialId(input.entry.label)
+    !isValidCustodyCredentialId(input.entry.credentialId)
   ) {
     return { status: 'refused' }
   }
@@ -1514,6 +1552,7 @@ export type ClaustrumCredential = {
   recordVersion: number
   projectId?: string
   accountId?: string
+  credentialId?: string
 }
 
 export type ClaustrumServedCredential = Pick<
@@ -1552,6 +1591,7 @@ type CredentialGetResult = {
   recordVersion: number
   projectId?: string
   accountId?: string
+  credentialId?: string
 }
 
 function credentialErrorAction(
@@ -1687,6 +1727,9 @@ function decodeCredentialGetResponse(response: unknown): CredentialGetResult {
     }),
     ...(typeof result?.account_id === 'string' && {
       accountId: result.account_id,
+    }),
+    ...(typeof result?.credential_id === 'string' && {
+      credentialId: result.credential_id,
     }),
   }
 }
@@ -1897,6 +1940,9 @@ export class ClaustrumCredentialCache {
       recordVersion: result.recordVersion,
       ...(result.projectId !== undefined && { projectId: result.projectId }),
       ...(result.accountId !== undefined && { accountId: result.accountId }),
+      ...(result.credentialId !== undefined && {
+        credentialId: result.credentialId,
+      }),
     }
     if (
       credential.expiresAtMs !== null &&
