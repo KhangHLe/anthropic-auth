@@ -736,23 +736,36 @@ async function getPlugin(
 }
 
 async function withoutClaustrumWarmupDeadline<T>(
-  fn: () => Promise<T>,
+  fn: (timerOverrides: PluginRuntimeOverrides) => Promise<T>,
 ): Promise<T> {
-  const originalSetTimeout = globalThis.setTimeout
+  const disabledHandles = new Set<ReturnType<typeof globalThis.setTimeout>>()
   const setTimeoutImpl = ((
     ...arguments_: Parameters<typeof globalThis.setTimeout>
-  ) =>
-    arguments_[1] === 100
-      ? ({ unref() {} } as ReturnType<typeof globalThis.setTimeout>)
-      : originalSetTimeout(...arguments_)) as typeof globalThis.setTimeout
-  const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(
-    setTimeoutImpl,
+  ) => {
+    if (arguments_[1] === 100) {
+      const handle = {
+        unref() {},
+      } as ReturnType<typeof globalThis.setTimeout>
+      disabledHandles.add(handle)
+      return handle
+    }
+    return globalThis.setTimeout(...arguments_)
+  }) as typeof globalThis.setTimeout
+  const clearTimeoutImpl = ((
+    handle: Parameters<typeof globalThis.clearTimeout>[0],
+  ) => {
+    if (
+      disabledHandles.delete(handle as ReturnType<typeof globalThis.setTimeout>)
+    ) {
+      return
+    }
+    globalThis.clearTimeout(handle)
+  }) as typeof globalThis.clearTimeout
+  return withDeadlockGuard(
+    fn({ setTimeout: setTimeoutImpl, clearTimeout: clearTimeoutImpl }),
+    4_000,
+    'Claustrum warmup test deadlocked',
   )
-  try {
-    return await fn()
-  } finally {
-    setTimeoutSpy.mockRestore()
-  }
 }
 
 function installRelayResponseStart(
@@ -2495,8 +2508,9 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        const plugin = await withoutClaustrumWarmupDeadline(() =>
+        const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
           getPlugin(undefined, undefined, {
+            ...timerOverrides,
             claustrumConnector: manifestConnector(
               [],
               new Map([[legacyHandle, 'migration-order-access']]),
@@ -2681,8 +2695,9 @@ describe('fallback Claustrum credential resolution', () => {
     const manifestPath = await writeManifest([])
     const restore = await configureClaustrumConnection()
     const calls: CredentialCall[] = []
-    const plugin = await withoutClaustrumWarmupDeadline(() =>
+    const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
       getPlugin(undefined, undefined, {
+        ...timerOverrides,
         claustrumConnector:
           input.connector?.(calls) ??
           manifestConnector(
@@ -2733,8 +2748,9 @@ describe('fallback Claustrum credential resolution', () => {
       const manifestPath = await writeManifest([])
       const restore = await configureClaustrumConnection()
       const calls: CredentialCall[] = []
-      const plugin = await withoutClaustrumWarmupDeadline(() =>
+      const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
         getPlugin(undefined, undefined, {
+          ...timerOverrides,
           claustrumConnector: manifestConnector(
             calls,
             new Map([[legacyHandle, 'retry-migration-access']]),
@@ -2903,14 +2919,16 @@ describe('fallback Claustrum credential resolution', () => {
           __setLogTestSink((record) => logs.push(record))
           let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
           try {
-            plugin = await withoutClaustrumWarmupDeadline(() =>
+            plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
               getPlugin(undefined, undefined, {
+                ...timerOverrides,
                 claustrumConnector: manifestConnector(
                   [],
                   new Map([[legacyHandle, 'fresh-lock-access']]),
                 ),
               }),
             )
+            await plugin.__fallbackRefreshReady
             expect(
               logs.some(
                 (record) =>
@@ -2996,8 +3014,9 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        const plugin = await withoutClaustrumWarmupDeadline(() =>
+        const plugin = await withoutClaustrumWarmupDeadline((timerOverrides) =>
           getPlugin(undefined, undefined, {
+            ...timerOverrides,
             claustrumConnector: manifestConnector(
               [],
               new Map([[legacyHandle, 'lock-owner-access']]),
@@ -3069,8 +3088,9 @@ describe('fallback Claustrum credential resolution', () => {
           },
         )
         try {
-          await withoutClaustrumWarmupDeadline(async () => {
+          await withoutClaustrumWarmupDeadline(async (timerOverrides) => {
             const pluginAPromise = getPlugin(undefined, undefined, {
+              ...timerOverrides,
               claustrumConnector: concurrentConnector,
             })
             await firstEntered.promise
@@ -3089,6 +3109,7 @@ describe('fallback Claustrum credential resolution', () => {
               'sidebar-state-b.json',
             )
             const pluginBPromise = getPlugin(undefined, undefined, {
+              ...timerOverrides,
               claustrumConnector: concurrentConnector,
             })
             await entered.promise
