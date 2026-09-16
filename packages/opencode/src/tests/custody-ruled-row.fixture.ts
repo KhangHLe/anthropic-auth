@@ -68,6 +68,7 @@ export function credentialResponse(
   recordVersion: number,
   expiresAtMs = Date.now() + 60_000,
   accountId?: string,
+  credentialId?: string,
 ) {
   return {
     result: {
@@ -77,6 +78,7 @@ export function credentialResponse(
       expires_at_ms: expiresAtMs,
       record_version: recordVersion,
       ...(accountId && { account_id: accountId }),
+      ...(credentialId && { credential_id: credentialId }),
     },
   }
 }
