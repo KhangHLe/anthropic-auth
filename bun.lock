@@ -22,7 +22,7 @@
       "name": "@cortexkit/anthropic-auth-core",
       "version": "1.22.0",
       "dependencies": {
-        "@cortexkit/subc-client": "^0.8.1",
+        "@cortexkit/subc-client": "^0.11.1",
         "xxhash-wasm": "^1.1.0",
       },
     },
@@ -213,7 +213,7 @@
 
     "@cortexkit/pi-anthropic-auth": ["@cortexkit/pi-anthropic-auth@workspace:packages/pi"],
 
-    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.8.1", "", {}, "sha512-8U9w3AnSff0QYlLVzcKOuTULakRtVpcGJrquGHxOQQlWZGzXZdCs8nroLMeoM2xhFGwxIh8xFk832w1KG6akAA=="],
+    "@cortexkit/subc-client": ["@cortexkit/subc-client@0.11.1", "", {}, "sha512-+T2GzdIHMJKtvS5uPG3FydyGbdvREla7N3B3inLgnVWxsO8v77rzMbmPX63ZD9OcJtnkDZjO5eFbfeIF+RUFWA=="],
 
     "@cspotcode/source-map-support": ["@cspotcode/source-map-support@0.8.1", "", { "dependencies": { "@jridgewell/trace-mapping": "0.3.9" } }, "sha512-IchNf6dN4tHoMFIn/7OE8LWZ19Y6q/67Bmf6vnGREv8RSbBVb9LPJxEcnwrcwX6ixSvaiGoomAUvu4YSxXrVgw=="],
 
