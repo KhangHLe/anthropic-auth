@@ -18918,6 +18918,76 @@ describe('auth.loader', () => {
         }),
       }),
     )
+
+    // A rapid fallback cycle can replace the pending switch notice while its
+    // asynchronous prompt-context lookup is still in flight. The stale send
+    // must stand down and the active flush must continue with the replacement.
+    mockClient.session.promptAsync.mockClear()
+    modelRequest = 0
+    const immediateMessages = mockClient.session.messages
+    let releasePromptContext: (() => void) | undefined
+    let messageLookups = 0
+    mockClient.session.messages = mock(() => {
+      messageLookups++
+      if (messageLookups > 1) return immediateMessages?.()
+      return new Promise<{ data: unknown[] }>((resolve) => {
+        releasePromptContext = () => {
+          void Promise.resolve(immediateMessages?.()).then((response) =>
+            resolve(response ?? { data: [] }),
+          )
+        }
+      })
+    })
+    const overtakenRequest = {
+      ...request,
+      headers: { 'x-session-affinity': 'ses_server_fallback_overtaken' },
+    }
+    const overtakenFallback = await result.fetch(MESSAGES_URL, overtakenRequest)
+    await overtakenFallback.text()
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: latestUserMessageId,
+            sessionID: 'ses_server_fallback_overtaken',
+            role: 'user',
+          },
+        },
+      },
+    })
+    await plugin.event?.({
+      event: {
+        type: 'session.idle',
+        properties: { sessionID: 'ses_server_fallback_overtaken' },
+      },
+    })
+    for (let attempt = 0; attempt < 100 && !releasePromptContext; attempt++) {
+      await Bun.sleep(1)
+    }
+    expect(releasePromptContext).toBeDefined()
+
+    const overtakenRestoration = await result.fetch(
+      MESSAGES_URL,
+      overtakenRequest,
+    )
+    await overtakenRestoration.text()
+    releasePromptContext?.()
+    await waitForMockCall(mockClient.session.promptAsync)
+
+    expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
+    expect(mockClient.session.promptAsync.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        body: expect.objectContaining({
+          parts: [
+            expect.objectContaining({
+              text: expect.stringContaining('Returning to Fable 5.1'),
+            }),
+          ],
+        }),
+      }),
+    )
+    mockClient.session.messages = immediateMessages
   })
 
   test('downgrades a filtered Fable session for ten successful Opus turns and warms Fable after each', async () => {
@@ -19344,6 +19414,20 @@ describe('auth.loader', () => {
       event: {
         type: 'session.updated',
         properties: { sessionID: 'ses_fable_filter' },
+      },
+    })
+    // The ignored switch notice is itself stored as a user message. Its event
+    // must not revoke the real user's idle-delivery lease for a newer notice.
+    await plugin.event?.({
+      event: {
+        type: 'message.updated',
+        properties: {
+          info: {
+            id: switchNotificationMessageId,
+            sessionID: 'ses_fable_filter',
+            role: 'user',
+          },
+        },
       },
     })
     expect(mockClient.session.promptAsync).toHaveBeenCalledTimes(1)
