@@ -1655,27 +1655,30 @@ describe('withCustodyManifestLock', () => {
   test.serial('reports a held lock as lock_busy', async () => {
     await withTempDirectory(async (directory) => {
       const path = join(directory, 'handles.json')
-      const firstEntered = Promise.withResolvers<void>()
-      const releaseFirst = Promise.withResolvers<void>()
+      const lockPath = `${path}.lock`
+      const times = [0, 29, 30]
+      let timeIndex = 0
+      await fs.mkdir(lockPath, { mode: 0o700 })
+      await fs.writeFile(
+        join(lockPath, 'owner'),
+        `${JSON.stringify({
+          tenant: 'anthropic-auth',
+          pid: process.pid,
+          claimed_at_ms: 0,
+          nonce: 'held-test',
+        })}\n`,
+      )
       __setCustodyManifestLockTestOptions({
         ttlMs: 30,
         retryMinMs: 1,
         retryMaxMs: 1,
-        renewalIntervalMs: 5,
+        now: () => times[Math.min(timeIndex++, times.length - 1)]!,
       })
-      const first = withCustodyManifestLock(path, async () => {
-        firstEntered.resolve()
-        await releaseFirst.promise
-      })
-      try {
-        await firstEntered.promise
-        await expect(
-          withCustodyManifestLock(path, async () => 'acquired'),
-        ).rejects.toMatchObject({ code: 'lock_busy' })
-      } finally {
-        releaseFirst.resolve()
-        await first
-      }
+
+      await expect(
+        withCustodyManifestLock(path, async () => 'acquired'),
+      ).rejects.toMatchObject({ code: 'lock_busy' })
+      await expect(fs.lstat(lockPath)).resolves.toBeDefined()
     })
   })
 

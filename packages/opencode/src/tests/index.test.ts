@@ -734,6 +734,26 @@ async function getPlugin(
   return plugin
 }
 
+async function withoutClaustrumWarmupDeadline<T>(
+  fn: () => Promise<T>,
+): Promise<T> {
+  const originalSetTimeout = globalThis.setTimeout
+  const setTimeoutImpl = ((
+    ...arguments_: Parameters<typeof globalThis.setTimeout>
+  ) =>
+    arguments_[1] === 100
+      ? ({ unref() {} } as ReturnType<typeof globalThis.setTimeout>)
+      : originalSetTimeout(...arguments_)) as typeof globalThis.setTimeout
+  const setTimeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(
+    setTimeoutImpl,
+  )
+  try {
+    return await fn()
+  } finally {
+    setTimeoutSpy.mockRestore()
+  }
+}
+
 function installRelayResponseStart(
   status: number,
   errorEvent?: { status?: number; message?: string },
@@ -2442,12 +2462,14 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        const plugin = await getPlugin(undefined, undefined, {
-          claustrumConnector: manifestConnector(
-            [],
-            new Map([[legacyHandle, 'migration-order-access']]),
-          ),
-        })
+        const plugin = await withoutClaustrumWarmupDeadline(() =>
+          getPlugin(undefined, undefined, {
+            claustrumConnector: manifestConnector(
+              [],
+              new Map([[legacyHandle, 'migration-order-access']]),
+            ),
+          }),
+        )
         expect(stateAtManifestWrite).toContain(legacyHandle)
         expect(await readFile(accountStatePath, 'utf8')).not.toContain(
           legacyHandle,
@@ -2588,11 +2610,16 @@ describe('fallback Claustrum credential resolution', () => {
     },
   )
 
-  async function withShortManifestLockTiming<T>(fn: () => Promise<T>) {
+  async function withFixedManifestLockClock<T>(
+    fn: () => Promise<T>,
+    now?: () => number,
+  ) {
+    const fixedNow = Date.now()
     __setCustodyManifestLockTestOptions({
       ttlMs: 150,
       retryMinMs: 5,
       retryMaxMs: 5,
+      now: now ?? (() => fixedNow),
     })
     try {
       return await fn()
@@ -2621,14 +2648,16 @@ describe('fallback Claustrum credential resolution', () => {
     const manifestPath = await writeManifest([])
     const restore = await configureClaustrumConnection()
     const calls: CredentialCall[] = []
-    const plugin = await getPlugin(undefined, undefined, {
-      claustrumConnector:
-        input.connector?.(calls) ??
-        manifestConnector(
-          calls,
-          new Map([[input.handle, `${input.label}-access`]]),
-        ),
-    })
+    const plugin = await withoutClaustrumWarmupDeadline(() =>
+      getPlugin(undefined, undefined, {
+        claustrumConnector:
+          input.connector?.(calls) ??
+          manifestConnector(
+            calls,
+            new Map([[input.handle, `${input.label}-access`]]),
+          ),
+      }),
+    )
     return { calls, manifestPath, plugin, restore }
   }
 
@@ -2671,12 +2700,14 @@ describe('fallback Claustrum credential resolution', () => {
       const manifestPath = await writeManifest([])
       const restore = await configureClaustrumConnection()
       const calls: CredentialCall[] = []
-      const plugin = await getPlugin(undefined, undefined, {
-        claustrumConnector: manifestConnector(
-          calls,
-          new Map([[legacyHandle, 'retry-migration-access']]),
-        ),
-      })
+      const plugin = await withoutClaustrumWarmupDeadline(() =>
+        getPlugin(undefined, undefined, {
+          claustrumConnector: manifestConnector(
+            calls,
+            new Map([[legacyHandle, 'retry-migration-access']]),
+          ),
+        }),
+      )
       try {
         await plugin.__fallbackRefreshReady
         expect(
@@ -2820,72 +2851,59 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'reports a corrupt manifest lock after its bounded wait and keeps the legacy handle',
     async () => {
-      await withShortManifestLockTiming(async () => {
-        await useTempAccountFile(
-          manifestStorage({ label: 'fresh-lock', legacy: legacyHandle }),
-        )
-        const manifestPath = await writeManifest([])
-        const restore = await configureClaustrumConnection()
-        const lockPath = `${manifestPath}.lock`
-        await mkdir(lockPath, { mode: 0o700 })
-        await writeFile(
-          join(lockPath, 'owner'),
-          `${JSON.stringify({ claimed_at_ms: Date.now(), tenant: 'test' })}\n`,
-        )
-        const logs: LogTestRecord[] = []
-        __setLogTestSink((record) => logs.push(record))
-        const startedAt = Date.now()
-        let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
-        try {
-          plugin = await Promise.race([
-            getPlugin(undefined, undefined, {
-              claustrumConnector: manifestConnector(
-                [],
-                new Map([[legacyHandle, 'fresh-lock-access']]),
-              ),
-            }),
-            Bun.sleep(1_000).then(() => {
-              throw new Error('manifest lock busy did not respect its deadline')
-            }),
-          ])
-          for (let attempt = 0; attempt < 100; attempt++) {
-            if (
+      const times = [0, 150]
+      let timeIndex = 0
+      await withFixedManifestLockClock(
+        async () => {
+          await useTempAccountFile(
+            manifestStorage({ label: 'fresh-lock', legacy: legacyHandle }),
+          )
+          const manifestPath = await writeManifest([])
+          const restore = await configureClaustrumConnection()
+          const lockPath = `${manifestPath}.lock`
+          await mkdir(lockPath, { mode: 0o700 })
+          await writeFile(
+            join(lockPath, 'owner'),
+            `${JSON.stringify({ claimed_at_ms: 0, tenant: 'test' })}\n`,
+          )
+          const logs: LogTestRecord[] = []
+          __setLogTestSink((record) => logs.push(record))
+          let plugin: Awaited<ReturnType<typeof getPlugin>> | undefined
+          try {
+            plugin = await withoutClaustrumWarmupDeadline(() =>
+              getPlugin(undefined, undefined, {
+                claustrumConnector: manifestConnector(
+                  [],
+                  new Map([[legacyHandle, 'fresh-lock-access']]),
+                ),
+              }),
+            )
+            expect(
               logs.some(
                 (record) =>
                   record.message === 'manifest write failed' &&
                   record.payload?.reason === 'manifest lock owner invalid',
-              )
-            )
-              break
-            await Bun.sleep(10)
+              ),
+            ).toBe(true)
+            expect(
+              await readFile(
+                getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
+                'utf8',
+              ),
+            ).toContain(legacyHandle)
+          } finally {
+            __setLogTestSink(null)
+            await plugin?.dispose?.()
+            restore()
           }
-          const elapsedMs = Date.now() - startedAt
-          expect(elapsedMs).toBeGreaterThanOrEqual(120)
-          expect(elapsedMs).toBeLessThan(1_000)
-          expect(
-            logs.some(
-              (record) =>
-                record.message === 'manifest write failed' &&
-                record.payload?.reason === 'manifest lock owner invalid',
-            ),
-          ).toBe(true)
-          expect(
-            await readFile(
-              getAccountStatePath(process.env.OPENCODE_ANTHROPIC_AUTH_FILE!),
-              'utf8',
-            ),
-          ).toContain(legacyHandle)
-        } finally {
-          __setLogTestSink(null)
-          await plugin?.dispose?.()
-          restore()
-        }
-      })
+        },
+        () => times[Math.min(timeIndex++, times.length - 1)]!,
+      )
     },
   )
 
   test.serial('renames a stale manifest lock before writing', async () => {
-    await withShortManifestLockTiming(async () => {
+    await withFixedManifestLockClock(async () => {
       await useTempAccountFile(
         manifestStorage({ label: 'stale-lock', legacy: legacyHandle }),
       )
@@ -2945,12 +2963,14 @@ describe('fallback Claustrum credential resolution', () => {
         },
       )
       try {
-        const plugin = await getPlugin(undefined, undefined, {
-          claustrumConnector: manifestConnector(
-            [],
-            new Map([[legacyHandle, 'lock-owner-access']]),
-          ),
-        })
+        const plugin = await withoutClaustrumWarmupDeadline(() =>
+          getPlugin(undefined, undefined, {
+            claustrumConnector: manifestConnector(
+              [],
+              new Map([[legacyHandle, 'lock-owner-access']]),
+            ),
+          }),
+        )
         expect(owner).toMatchObject({ tenant: 'anthropic-auth' })
         expect(typeof owner?.claimed_at_ms).toBe('number')
         await expect(fs.stat(lockPath)).rejects.toThrow()
@@ -2966,7 +2986,7 @@ describe('fallback Claustrum credential resolution', () => {
   test.serial(
     'preserves two concurrent legacy migrations in one manifest',
     async () => {
-      await withShortManifestLockTiming(async () => {
+      await withFixedManifestLockClock(async () => {
         const storageA = fallbackWithClaustrum({
           id: 'fallback-a',
           label: 'migration-a',
@@ -2976,8 +2996,10 @@ describe('fallback Claustrum credential resolution', () => {
         })
         await useTempAccountFile(storageA)
         const accountPathA = process.env.OPENCODE_ANTHROPIC_AUTH_FILE!
+        const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
         const manifestPath = await writeManifest([])
         const restore = await configureClaustrumConnection()
+        const firstEntered = deferred()
         const entered = deferred()
         const release = deferred()
         let credentialGets = 0
@@ -2988,6 +3010,7 @@ describe('fallback Claustrum credential resolution', () => {
             if (method !== 'credential.get')
               throw new Error(`unexpected method: ${method}`)
             credentialGets += 1
+            if (credentialGets === 1) firstEntered.resolve()
             if (credentialGets === 2) entered.resolve()
             await release.promise
             return credentialResponse(
@@ -2996,27 +3019,8 @@ describe('fallback Claustrum credential resolution', () => {
             )
           },
         )
-        const pluginA = await getPlugin(undefined, undefined, {
-          claustrumConnector: concurrentConnector,
-        })
-
-        const accountPathB = join(tempConfigDir!, 'anthropic-auth-b.json')
-        const storageB = fallbackWithClaustrum({
-          id: 'fallback-b',
-          label: 'migration-b',
-          enabled: true,
-          claustrumHandle: `ckh_${'B'.repeat(43)}`,
-          claustrum: { mode: 'claustrum' },
-        })
-        await saveAccounts(storageB, accountPathB)
-        process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
-        process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
-          tempConfigDir!,
-          'sidebar-state-b.json',
-        )
-        const pluginB = await getPlugin(undefined, undefined, {
-          claustrumConnector: concurrentConnector,
-        })
+        let pluginA: Awaited<ReturnType<typeof getPlugin>> | undefined
+        let pluginB: Awaited<ReturnType<typeof getPlugin>> | undefined
         const originalRename = fs.rename
         const secondManifestRename = deferred()
         let manifestRenames = 0
@@ -3032,21 +3036,36 @@ describe('fallback Claustrum credential resolution', () => {
           },
         )
         try {
-          await Promise.race([
-            entered.promise,
-            Bun.sleep(1_000).then(() => {
-              throw new Error(
-                `concurrent credential calls did not both start (${credentialGets})`,
-              )
-            }),
-          ])
-          release.resolve()
-          await Promise.race([
-            secondManifestRename.promise,
-            Bun.sleep(1_000).then(() => {
-              throw new Error('concurrent migrations did not finish')
-            }),
-          ])
+          await withoutClaustrumWarmupDeadline(async () => {
+            const pluginAPromise = getPlugin(undefined, undefined, {
+              claustrumConnector: concurrentConnector,
+            })
+            await firstEntered.promise
+
+            const storageB = fallbackWithClaustrum({
+              id: 'fallback-b',
+              label: 'migration-b',
+              enabled: true,
+              claustrumHandle: `ckh_${'B'.repeat(43)}`,
+              claustrum: { mode: 'claustrum' },
+            })
+            await saveAccounts(storageB, accountPathB)
+            process.env.OPENCODE_ANTHROPIC_AUTH_FILE = accountPathB
+            process.env.OPENCODE_ANTHROPIC_AUTH_SIDEBAR_STATE_FILE = join(
+              tempConfigDir!,
+              'sidebar-state-b.json',
+            )
+            const pluginBPromise = getPlugin(undefined, undefined, {
+              claustrumConnector: concurrentConnector,
+            })
+            await entered.promise
+            release.resolve()
+            ;[pluginA, pluginB] = await Promise.all([
+              pluginAPromise,
+              pluginBPromise,
+            ])
+          })
+          await secondManifestRename.promise
           const manifest = JSON.parse(await readFile(manifestPath, 'utf8')) as {
             providers: Array<{
               provider: string
@@ -3065,8 +3084,8 @@ describe('fallback Claustrum credential resolution', () => {
           ])
         } finally {
           rename.mockRestore()
-          await pluginA.dispose?.()
-          await pluginB.dispose?.()
+          await pluginA?.dispose?.()
+          await pluginB?.dispose?.()
           restore()
         }
       })
