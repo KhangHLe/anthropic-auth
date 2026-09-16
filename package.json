@@ -31,7 +31,7 @@
     "@earendil-works/pi-tui": "0.85.1",
     "@opencode-ai/plugin": "1.18.29",
     "@tsconfig/bun": "1.0.11",
-    "@types/bun": "1.4.1",
+    "@types/bun": "1.4.2",
     "dedent": "^1.7.2",
     "lefthook": "2.1.12",
     "miniflare": "^4.20260730.0",
