@@ -18962,7 +18962,9 @@ describe('auth.loader', () => {
     let messageLookups = 0
     mockClient.session.messages = mock(() => {
       messageLookups++
-      if (messageLookups > 1) return immediateMessages?.()
+      if (messageLookups > 1) {
+        return immediateMessages?.() ?? Promise.resolve({ data: [] })
+      }
       return new Promise<{ data: unknown[] }>((resolve) => {
         releasePromptContext = () => {
           void Promise.resolve(immediateMessages?.()).then((response) =>
