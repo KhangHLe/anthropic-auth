@@ -5555,6 +5555,7 @@ const anthropicAuthPlugin = async (
             if (!(error instanceof CustodyStateMismatchError)) throw error
             custodyStartupMismatchVerdict = error.verdict
             return {
+              apiKey: '',
               fetch: async () => {
                 throw error
               },
@@ -5577,6 +5578,7 @@ const anthropicAuthPlugin = async (
             !isCustodyTombstoneOAuth(auth, 'anthropic')
           ) {
             return {
+              apiKey: '',
               fetch: async () => claustrumMainRefusal('takeover-incomplete'),
             }
           }
