@@ -229,6 +229,7 @@ import {
 } from './custody-dimensions.ts'
 import { runClaustrumTakeoverCommand } from './custody-live.ts'
 import {
+  CUSTODY_PREFLIGHT_MIN_TTL_MS,
   CustodyStateMismatchError,
   type MainCustodyRefusal,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
@@ -961,7 +962,8 @@ const CLAUSTRUM_REAUTH_WARM_BACKOFF_MS = FALLBACK_BACKGROUND_TICK_MS
 
 function getConfiguredClaustrumConnectionFile(): string | undefined {
   const configured =
-    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim()
+    process.env.OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE?.trim() ||
+    process.env.CLAUSTRUM_SUBC_CONNECTION?.trim()
   return configured || undefined
 }
 
@@ -2497,7 +2499,11 @@ const anthropicAuthPlugin = async (
           if (cache) {
             try {
               const credential = initial
-                ? await getStartupWarmCredential(cache, handle, minTtlMs)
+                ? await getStartupWarmCredential(
+                    cache,
+                    handle,
+                    CUSTODY_PREFLIGHT_MIN_TTL_MS,
+                  )
                 : await cache.get(handle, minTtlMs)
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
                 await markClaustrumCredentialReady('main', handle)
@@ -2532,7 +2538,11 @@ const anthropicAuthPlugin = async (
       if (!cache) continue
       try {
         const credential = initial
-          ? await getStartupWarmCredential(cache, handle, minTtlMs)
+          ? await getStartupWarmCredential(
+              cache,
+              handle,
+              CUSTODY_PREFLIGHT_MIN_TTL_MS,
+            )
           : await cache.get(handle, minTtlMs)
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
           logger.debug('refresh', 'vault fallback credential unusable', {
@@ -3668,7 +3678,7 @@ const anthropicAuthPlugin = async (
             // new account's quota.
             quota: options.skipFallbackQuotaSeed
               ? null
-              : account.access
+              : vaultServed || account.access
                 ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
                 : null,
             // A fallback with a permanently-dead refresh token (400 invalid_grant)
@@ -5585,6 +5595,8 @@ const anthropicAuthPlugin = async (
             }
           }
           mainAccountId = await getOrCreateMainAccountId(accountStoragePath)
+          mainQuotaAccountId ??=
+            mainCustody.anthropicAccountUuid ?? mainAccountId
           if (auth.access) {
             await resolveMainQuotaAccountIdentity(auth.access)
           }
@@ -6427,7 +6439,7 @@ const anthropicAuthPlugin = async (
             requestHeaders.delete('x-opencode-session')
             requestHeaders.delete(EFFORT_PLAN_REQUEST_HEADER)
             requestHeaders.delete(BILLING_LINEAGE_REQUEST_HEADER)
-            let body = init?.body
+            let body = await fetchBody(input, init)
             const previousDiagnosticsMessage = relayAffinity
               ? cacheDiagnosticsTracker.previousFor(relayAffinity)
               : null
