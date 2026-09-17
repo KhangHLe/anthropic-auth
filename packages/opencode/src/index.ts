@@ -3664,12 +3664,15 @@ const anthropicAuthPlugin = async (
             id: account.id,
             label: account.label,
             tierLabel: formatOAuthAccountTier(account.profile),
-            // Token-aware read: if a fallback account was re-logged with the same
-            // id/label, an old in-memory quota snapshot must not be shown as the
-            // new account's quota.
+            // Token-aware read: local access or a live vault-served tombstone
+            // qualifies the lineage-bound cache read. If a fallback account was
+            // re-logged with the same id/label, an old in-memory quota snapshot
+            // must not be shown as the new account's quota; vault-served
+            // tombstones have no local access by design, but their live binding
+            // proves the snapshot belongs to the currently served account.
             quota: options.skipFallbackQuotaSeed
               ? null
-              : vaultServed || account.access
+              : account.access || vaultServed
                 ? (quotaManager.getFallback(account.id, account)?.quota ?? null)
                 : null,
             // A fallback with a permanently-dead refresh token (400 invalid_grant)
