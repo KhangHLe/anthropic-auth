@@ -1272,6 +1272,7 @@ export async function writeCustodyHandleManifestEntryLocked(
       ...providers,
       {
         provider: 'anthropic',
+        shape: 'oauth',
         serve: 'anthropic-auth',
         accounts: [
           {
@@ -1293,6 +1294,7 @@ export async function writeCustodyHandleManifestEntryLocked(
       matching.length === 1 &&
       matching[0]?.handle === input.entry.handle &&
       matching[0]?.credential_id === input.entry.credentialId &&
+      block.shape === 'oauth' &&
       !corruptLabels.has(input.entry.label)
     ) {
       return { status: 'unchanged' }
@@ -1317,7 +1319,7 @@ export async function writeCustodyHandleManifestEntryLocked(
       replacement,
     )
     nextProviders = providers.map((provider, index) =>
-      index === blockIndex ? { ...block, accounts } : provider,
+      index === blockIndex ? { ...block, shape: 'oauth', accounts } : provider,
     )
   }
 
