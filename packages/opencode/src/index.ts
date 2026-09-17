@@ -229,7 +229,6 @@ import {
 } from './custody-dimensions.ts'
 import { runClaustrumTakeoverCommand } from './custody-live.ts'
 import {
-  CUSTODY_PREFLIGHT_MIN_TTL_MS,
   CustodyStateMismatchError,
   type MainCustodyRefusal,
   OPENCODE_MAIN_OAUTH_REFRESH_LOCK,
@@ -2499,11 +2498,7 @@ const anthropicAuthPlugin = async (
           if (cache) {
             try {
               const credential = initial
-                ? await getStartupWarmCredential(
-                    cache,
-                    handle,
-                    CUSTODY_PREFLIGHT_MIN_TTL_MS,
-                  )
+                ? await getStartupWarmCredential(cache, handle, minTtlMs)
                 : await cache.get(handle, minTtlMs)
               if (usableClaustrumAccessToken(credential, claustrumNow())) {
                 await markClaustrumCredentialReady('main', handle)
@@ -2538,11 +2533,7 @@ const anthropicAuthPlugin = async (
       if (!cache) continue
       try {
         const credential = initial
-          ? await getStartupWarmCredential(
-              cache,
-              handle,
-              CUSTODY_PREFLIGHT_MIN_TTL_MS,
-            )
+          ? await getStartupWarmCredential(cache, handle, minTtlMs)
           : await cache.get(handle, minTtlMs)
         if (!usableClaustrumAccessToken(credential, claustrumNow())) {
           logger.debug('refresh', 'vault fallback credential unusable', {
