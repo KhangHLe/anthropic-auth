@@ -1590,13 +1590,17 @@ describe('fallback Claustrum credential resolution', () => {
       const existingHandle = `ckh_${'E'.repeat(43)}`
       const addedHandle = `ckh_${'N'.repeat(43)}`
       const mainHandle = `ckh_${'Q'.repeat(43)}`
-      await useTempAccountFile(
-        manifestStorage({
-          label: 'existing',
-          enabled: false,
-          tombstone: true,
-        }),
-      )
+      const storage = manifestStorage({
+        label: 'existing',
+        enabled: false,
+        tombstone: true,
+      })
+      storage.quota = {
+        enabled: true,
+        checkIntervalMinutes: 5,
+        failClosedOnUnknownQuota: true,
+      }
+      await useTempAccountFile(storage)
       await writeManifest([
         {
           label: 'main',
@@ -1633,7 +1637,23 @@ describe('fallback Claustrum credential resolution', () => {
       ])
       const calls: CredentialCall[] = []
       const modelAuthorizations: string[] = []
+      const quotaAuthorizations: string[] = []
       globalThis.fetch = mock(async (input, init) => {
+        if (extractUrl(input).includes('/api/oauth/usage')) {
+          quotaAuthorizations.push(
+            new Headers(init?.headers).get('authorization') ?? '',
+          )
+          return new Response(
+            JSON.stringify({
+              five_hour: { utilization: 0.1 },
+              seven_day: { utilization: 0.2 },
+            }),
+            {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            },
+          )
+        }
         if (extractUrl(input).includes('/v1/messages')) {
           modelAuthorizations.push(
             new Headers(init?.headers).get('authorization') ?? '',
@@ -1683,7 +1703,8 @@ describe('fallback Claustrum credential resolution', () => {
           (account) =>
             account.label === 'added' &&
             isOAuthAccount(account) &&
-            account.refresh === custodyTombstoneKey('anthropic'),
+            account.refresh === custodyTombstoneKey('anthropic') &&
+            account.quota?.five_hour?.usedPercent === 0.1,
         ) &&
         Date.now() < enrollmentDeadline
       ) {
@@ -1705,6 +1726,12 @@ describe('fallback Claustrum credential resolution', () => {
         added && isOAuthAccount(added) ? added.claustrumHandle : undefined,
       ).toBeUndefined()
       expect(JSON.stringify(added)).not.toContain(addedHandle)
+      expect(quotaAuthorizations).toContain('Bearer vault-added')
+      expect(
+        added && isOAuthAccount(added)
+          ? added.quota?.five_hour?.usedPercent
+          : null,
+      ).toBe(0.1)
       expect(
         saved?.accounts.find((account) => account.label === 'existing')
           ?.enabled,

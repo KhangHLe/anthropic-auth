@@ -5341,6 +5341,9 @@ const anthropicAuthPlugin = async (
         .then(async () => {
           const enrollment = await refreshManifestEnrollments()
           if (enrollment.enrolledAccountIds.length > 0) {
+            // Populate the new route's quota immediately so sticky-balanced
+            // routing does not observe an avoidable incomplete-pool window.
+            await fallbackManager.refreshQuotaForDueAccounts()
             await refreshSidebarQuota()
           }
         })
